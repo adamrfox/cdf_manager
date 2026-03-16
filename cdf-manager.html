@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CDF Manager</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600;700&family=Barlow+Condensed:wght@600;700&display=swap');
+
+:root {
+  --bg:           #1a1f2e;
+  --surface:      #212736;
+  --surface2:     #252c3b;
+  --border:       #2e3a4e;
+  --border-bright:#4a6080;
+  --accent:       #38b8f0;
+  --accent2:      #1db8e8;
+  --accent-glow:  rgba(56,184,240,0.15);
+  --warn:         #f5a623;
+  --danger:       #ff5470;
+  --ok:           #3ddbc8;
+  --purple:       #a78bfa;
+  --text:         #c8d8e8;
+  --text-dim:     #7a90a8;
+  --text-bright:  #ffffff;
+  --mono:         'Share Tech Mono', monospace;
+  --sans:         'Barlow', sans-serif;
+  --cond:         'Barlow Condensed', sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: var(--sans); min-height: 100vh; }
+
+/* ── SCREENS ── */
+.screen { display: none; }
+.screen.active { display: flex; }
+
+/* ── BUTTONS ── */
+.btn {
+  background: transparent; border: 1px solid var(--accent); color: var(--accent);
+  font-family: var(--cond); font-size: 13px; font-weight: 700; letter-spacing: 2px;
+  padding: 11px 20px; cursor: pointer; position: relative; overflow: hidden;
+  transition: color 0.2s; white-space: nowrap;
+}
+.btn::before {
+  content: ''; position: absolute; inset: 0; background: var(--accent);
+  transform: translateX(-100%); transition: transform 0.25s ease;
+}
+.btn:hover::before { transform: translateX(0); }
+.btn span { position: relative; z-index: 1; }
+.btn:hover { color: var(--bg); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn.danger  { border-color: var(--danger); color: var(--danger); }
+.btn.danger::before { background: var(--danger); }
+.btn.danger:hover { color: var(--bg); }
+.btn.warn    { border-color: var(--warn); color: var(--warn); }
+.btn.warn::before { background: var(--warn); }
+.btn.warn:hover { color: var(--bg); }
+.btn.purple  { border-color: var(--purple); color: var(--purple); }
+.btn.purple::before { background: var(--purple); }
+.btn.purple:hover { color: var(--bg); }
+.btn.sm { font-size: 11px; padding: 6px 12px; letter-spacing: 1px; }
+.btn.xs { font-size: 10px; padding: 4px 8px; letter-spacing: 1px; }
+
+/* ── FORMS ── */
+.field { margin-bottom: 16px; }
+.field label { display: block; font-family: var(--mono); font-size: 11px; color: var(--accent); letter-spacing: 2px; margin-bottom: 5px; }
+.field input, .field select {
+  width: 100%; background: var(--bg); border: 1px solid var(--border);
+  color: var(--text-bright); font-family: var(--mono); font-size: 13px;
+  padding: 9px 12px; outline: none; transition: border-color 0.2s;
+}
+.field input:focus, .field select:focus { border-color: var(--accent); }
+.field input::placeholder { color: var(--text-dim); }
+.field select option { background: var(--surface2); }
+.error-msg {
+  padding: 9px 12px; background: rgba(255,84,112,0.08);
+  border: 1px solid rgba(255,84,112,0.3); color: var(--danger);
+  font-family: var(--mono); font-size: 11px; margin-top: 10px; display: none;
+}
+
+/* ── MODALS ── */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(10,13,20,0.85);
+  display: none; align-items: center; justify-content: center; z-index: 200;
+  backdrop-filter: blur(4px);
+}
+.modal-overlay.open { display: flex; }
+.modal {
+  width: 440px; background: var(--surface); border: 1px solid var(--border-bright);
+  padding: 30px; position: relative; animation: slideUp 0.2s ease;
+  box-shadow: 0 0 60px rgba(0,0,0,0.5);
+}
+.modal::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+}
+.modal-title { font-family: var(--cond); font-size: 16px; font-weight: 700; color: var(--text-bright); letter-spacing: 2px; margin-bottom: 22px; }
+.modal-subtitle { font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-bottom: 18px; line-height: 1.7; }
+.modal-actions { display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; }
+
+/* ── TOP BAR ── */
+.top-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 24px; border-bottom: 1px solid var(--border);
+  background: rgba(26,31,46,0.97); position: sticky; top: 0; z-index: 50;
+}
+.top-bar-left  { display: flex; align-items: center; gap: 12px; }
+.top-bar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.app-title { font-family: var(--cond); font-size: 20px; font-weight: 700; color: var(--text-bright); letter-spacing: 1px; }
+.app-sub   { font-family: var(--mono); font-size: 11px; color: var(--text-dim); letter-spacing: 2px; }
+.user-badge {
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+  background: var(--surface2); border: 1px solid var(--border); padding: 4px 10px;
+}
+.user-badge .uname { color: var(--accent); }
+.role-badge {
+  font-family: var(--mono); font-size: 10px; padding: 3px 8px; border: 1px solid;
+  letter-spacing: 1px;
+}
+.role-badge.admin          { color: var(--warn);   border-color: var(--warn); }
+.role-badge.portal_manager { color: var(--purple); border-color: var(--purple); }
+.role-badge.monitor        { color: var(--ok);     border-color: var(--ok); }
+
+/* ── TABS ── */
+.tabs { display: flex; border-bottom: 1px solid var(--border); padding: 0 24px; background: var(--surface); }
+.tab {
+  font-family: var(--cond); font-size: 13px; font-weight: 700; letter-spacing: 2px;
+  padding: 12px 20px; cursor: pointer; border-bottom: 2px solid transparent;
+  color: var(--text-dim); transition: color 0.2s, border-color 0.2s;
+}
+.tab:hover  { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* ── REFRESH BAR ── */
+.refresh-bar {
+  display: flex; align-items: center; gap: 14px; padding: 8px 24px;
+  border-bottom: 1px solid var(--border); background: var(--surface);
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+}
+.refresh-bar-track { flex: 1; height: 3px; background: var(--border); }
+.refresh-bar-fill  { height: 100%; background: var(--accent); transition: width 1s linear; }
+
+/* ── CARDS GRID ── */
+.cards-body  { padding: 22px 24px; }
+.cards-grid  { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+
+/* ── CLUSTER CARD ── */
+.cluster-card {
+  background: var(--surface); border: 1px solid var(--border);
+  position: relative; overflow: hidden; transition: border-color 0.2s;
+}
+.cluster-card:hover { border-color: var(--border-bright); }
+.cluster-card-stripe {
+  position: absolute; top: 0; left: 0; right: 0; height: 2px;
+}
+.cluster-card-header {
+  padding: 14px 16px 10px; display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+}
+.cluster-card-name { font-family: var(--cond); font-size: 16px; font-weight: 700; color: var(--text-bright); }
+.cluster-card-host { font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+.status-badge {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 1px;
+  padding: 3px 7px; border: 1px solid; flex-shrink: 0;
+}
+.status-badge.ok     { color: var(--ok);     border-color: var(--ok); }
+.status-badge.warn   { color: var(--warn);   border-color: var(--warn); }
+.status-badge.danger { color: var(--danger); border-color: var(--danger); }
+.status-badge.dim    { color: var(--text-dim); border-color: var(--border-bright); }
+
+.cluster-card-body   { padding: 0 16px 12px; }
+.cluster-card-actions { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* Usage bar */
+.usage-bar-track { height: 5px; background: var(--border); margin: 6px 0 10px; }
+.usage-bar-fill  { height: 100%; transition: width 0.5s ease; }
+
+/* No-auth state */
+.noauth-body { padding: 14px 16px; font-family: var(--mono); font-size: 12px; color: var(--text-dim); line-height: 1.7; text-align: center; }
+
+/* Meta row */
+.meta-row { display: flex; gap: 14px; flex-wrap: wrap; font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-top: 8px; }
+.meta-row span { color: var(--text); }
+
+/* ── PORTAL TABLE ── */
+.portal-section { padding: 22px 24px; }
+.portal-section-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 14px;
+}
+.section-title { font-family: var(--cond); font-size: 15px; font-weight: 700; color: var(--text-bright); letter-spacing: 2px; }
+.portal-table { width: 100%; border-collapse: collapse; }
+.portal-table th {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--accent);
+  padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+.portal-table td {
+  font-family: var(--mono); font-size: 12px; color: var(--text); padding: 10px 12px;
+  border-bottom: 1px solid var(--border); vertical-align: middle;
+}
+.portal-table tr:hover td { background: var(--surface2); }
+.portal-table .dim { color: var(--text-dim); }
+
+/* ── LOGIN SCREEN ── */
+#screen-login { min-height: 100vh; align-items: center; justify-content: center; }
+.login-card {
+  width: 400px; background: var(--surface); border: 1px solid var(--border-bright);
+  padding: 38px; position: relative;
+  box-shadow: 0 0 60px rgba(56,184,240,0.07), inset 0 1px 0 rgba(56,184,240,0.07);
+}
+.login-card::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+}
+.login-brand { display: flex; align-items: center; gap: 14px; margin-bottom: 30px; }
+.login-brand-text h1 { font-family: var(--cond); font-size: 28px; font-weight: 700; color: var(--text-bright); letter-spacing: 1px; line-height: 1; }
+.login-brand-text p  { font-family: var(--mono); font-size: 11px; color: var(--accent); letter-spacing: 2px; margin-top: 4px; }
+.login-footer { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); font-family: var(--mono); font-size: 11px; color: var(--text-dim); line-height: 1.7; }
+
+/* ── USERS TABLE ── */
+.users-table { width: 100%; border-collapse: collapse; }
+.users-table th { font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--accent); padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+.users-table td { font-family: var(--mono); font-size: 12px; color: var(--text); padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.users-table tr:hover td { background: var(--surface2); }
+
+/* ── EMPTY / LOADING STATES ── */
+.empty-state { text-align: center; padding: 48px 20px; font-family: var(--mono); font-size: 12px; color: var(--text-dim); line-height: 2; }
+.spinner { width: 24px; height: 24px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 10px; }
+
+/* ── TOKEN WARNING ── */
+.token-warning {
+  background: rgba(245,166,35,0.08); border: 1px solid rgba(245,166,35,0.3);
+  border-left: 3px solid var(--warn); padding: 10px 14px; margin-bottom: 16px;
+  font-family: var(--mono); font-size: 11px; color: var(--warn); line-height: 1.7; display: none;
+}
+
+/* ── LOG ── */
+.log-panel { margin: 0 24px 24px; border: 1px solid var(--border); }
+.log-panel-header { padding: 8px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.log-body { padding: 8px 14px; max-height: 100px; overflow-y: auto; font-family: var(--mono); font-size: 11px; color: var(--text-dim); line-height: 1.8; display: flex; flex-direction: column-reverse; }
+.log-entry { display: flex; gap: 10px; }
+.log-time  { color: var(--text-dim); flex-shrink: 0; }
+.log-msg.ok   { color: var(--ok); }
+.log-msg.err  { color: var(--danger); }
+.log-msg.info { color: var(--accent); }
+.log-msg.warn { color: var(--warn); }
+
+/* ── MISC ── */
+@keyframes spin    { to { transform: rotate(360deg); } }
+@keyframes fadeIn  { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes slideUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-bright); }
+.divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+</style>
+</head>
+<body>
+
+<!-- ══ LOGIN ══════════════════════════════════════════════════════════ -->
+<div id="screen-login" class="screen">
+  <div class="login-card">
+    <div class="login-brand">
+      <svg width="44" height="55" viewBox="0 0 100 125" fill="none">
+        <rect x="38" y="0"  width="58" height="58" rx="14" fill="#38b8f0"/>
+        <rect x="0"  y="38" width="65" height="65" rx="16" fill="#2a7fc4"/>
+        <rect x="65" y="90" width="35" height="35" rx="9"  fill="#38b8f0"/>
+        <rect x="38" y="38" width="27" height="20" rx="6"  fill="#1a5a90" opacity="0.85"/>
+      </svg>
+      <div class="login-brand-text">
+        <h1>CDF Manager</h1>
+        <p>QUMULO PORTAL OPERATIONS</p>
+      </div>
+    </div>
+    <div class="field"><label>USERNAME</label><input type="text" id="login-username" placeholder="admin" autocomplete="username"/></div>
+    <div class="field"><label>PASSWORD</label><input type="password" id="login-password" placeholder="••••••••" autocomplete="current-password"/></div>
+    <button class="btn" id="login-btn" onclick="doAppLogin()" style="width:100%"><span id="login-btn-text">SIGN IN</span></button>
+    <div class="error-msg" id="login-error"></div>
+    <div class="login-footer">Sign in with your CDF Manager credentials.<br>Cluster credentials are managed separately per-session.</div>
+  </div>
+</div>
+
+<!-- ══ DASHBOARD ══════════════════════════════════════════════════════ -->
+<div id="screen-dashboard" class="screen" style="flex-direction:column;min-height:100vh">
+
+  <!-- Top bar -->
+  <div class="top-bar">
+    <div class="top-bar-left">
+      <svg width="20" height="25" viewBox="0 0 100 125" fill="none">
+        <rect x="38" y="0"  width="58" height="58" rx="14" fill="#38b8f0"/>
+        <rect x="0"  y="38" width="65" height="65" rx="16" fill="#2a7fc4"/>
+        <rect x="65" y="90" width="35" height="35" rx="9"  fill="#38b8f0"/>
+        <rect x="38" y="38" width="27" height="20" rx="6"  fill="#1a5a90" opacity="0.85"/>
+      </svg>
+      <span class="app-title">CDF Manager</span>
+      <span class="app-sub">PORTAL OPERATIONS</span>
+    </div>
+    <div class="top-bar-right">
+      <div class="user-badge">Signed in as <span class="uname" id="topbar-user">—</span></div>
+      <span class="role-badge" id="topbar-role">—</span>
+      <button class="btn sm purple" id="btn-manage-users" onclick="doUsersOpen()" style="display:none"><span>⚙ USERS</span></button>
+      <button class="btn sm danger" onclick="doAppLogout()"><span>SIGN OUT</span></button>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" id="tab-spokes"  onclick="switchTab('spokes')">SPOKES</div>
+    <div class="tab"        id="tab-hubs"    onclick="switchTab('hubs')"   style="display:none">HUBS</div>
+    <div class="tab"        id="tab-portals" onclick="switchTab('portals')" style="display:none">PORTALS</div>
+  </div>
+
+  <!-- Refresh bar -->
+  <div class="refresh-bar">
+    <span>REFRESH IN <strong id="countdown-num" style="color:var(--accent)">30</strong>s</span>
+    <div class="refresh-bar-track"><div class="refresh-bar-fill" id="refresh-fill" style="width:100%"></div></div>
+    <button class="btn sm" onclick="doRefresh()" style="padding:3px 10px;font-size:10px"><span>↺ NOW</span></button>
+  </div>
+
+  <!-- Tab panels -->
+  <div id="panel-spokes"  class="tab-panel cards-body"></div>
+  <div id="panel-hubs"    class="tab-panel cards-body" style="display:none"></div>
+  <div id="panel-portals" class="tab-panel portal-section" style="display:none"></div>
+
+  <!-- Log -->
+  <div class="log-panel" style="margin-top:auto">
+    <div class="log-panel-header">
+      <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim);letter-spacing:1px">ACTIVITY LOG</span>
+    </div>
+    <div class="log-body" id="log-body"></div>
+  </div>
+</div>
+
+<!-- ══ MODALS ═════════════════════════════════════════════════════════ -->
+
+<!-- Add Spoke -->
+<div class="modal-overlay" id="modal-add-spoke">
+  <div class="modal">
+    <div class="modal-title">ADD SPOKE CLUSTER</div>
+    <div class="field"><label>DISPLAY NAME</label><input type="text" id="add-spoke-name" placeholder="e.g. Fox Lab Videos"/></div>
+    <div class="field"><label>HOST / IP</label><input type="text" id="add-spoke-host" placeholder="10.x.x.x  (port 8000 assumed)"/></div>
+    <div class="error-msg" id="add-spoke-error"></div>
+    <div class="modal-actions">
+      <button class="btn sm danger" onclick="closeModal('modal-add-spoke')"><span>CANCEL</span></button>
+      <button class="btn sm" onclick="doAddSpoke()"><span>ADD SPOKE</span></button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Hub -->
+<div class="modal-overlay" id="modal-add-hub">
+  <div class="modal">
+    <div class="modal-title">ADD HUB CLUSTER</div>
+    <div class="field"><label>DISPLAY NAME</label><input type="text" id="add-hub-name" placeholder="e.g. Central Hub"/></div>
+    <div class="field"><label>HOST / IP</label><input type="text" id="add-hub-host" placeholder="10.x.x.x  (port 8000 assumed)"/></div>
+    <div class="error-msg" id="add-hub-error"></div>
+    <div class="modal-actions">
+      <button class="btn sm danger" onclick="closeModal('modal-add-hub')"><span>CANCEL</span></button>
+      <button class="btn sm" onclick="doAddHub()"><span>ADD HUB</span></button>
+    </div>
+  </div>
+</div>
+
+<!-- Auth Cluster (spoke or hub) -->
+<div class="modal-overlay" id="modal-auth">
+  <div class="modal">
+    <div class="modal-title" id="auth-title">AUTHENTICATE</div>
+    <div class="token-warning" id="auth-token-warning">⚠ Token expired. Re-enter credentials to get a new token.</div>
+    <div class="modal-subtitle" id="auth-subtitle"></div>
+    <div class="field"><label>QUMULO USERNAME</label><input type="text" id="auth-username" value="admin"/></div>
+    <div class="field"><label>QUMULO PASSWORD</label><input type="password" id="auth-password" placeholder="••••••••"/></div>
+    <div class="error-msg" id="auth-error"></div>
+    <div class="modal-actions">
+      <button class="btn sm danger" onclick="closeModal('modal-auth')"><span>CANCEL</span></button>
+      <button class="btn sm" id="auth-submit" onclick="doAuth()"><span>AUTHENTICATE</span></button>
+    </div>
+  </div>
+</div>
+
+<!-- Create Portal -->
+<div class="modal-overlay" id="modal-create-portal">
+  <div class="modal" style="width:480px">
+    <div class="modal-title">CREATE PORTAL RELATIONSHIP</div>
+    <div class="modal-subtitle">Select the spoke cluster and hub cluster, then specify the root paths on each side.</div>
+    <div class="field">
+      <label>SPOKE CLUSTER</label>
+      <select id="portal-spoke-select"></select>
+    </div>
+    <div class="field">
+      <label>SPOKE ROOT PATH</label>
+      <input type="text" id="portal-spoke-root" placeholder="/spoke-data"/>
+    </div>
+    <div class="field">
+      <label>HUB CLUSTER</label>
+      <select id="portal-hub-select"></select>
+    </div>
+    <div class="field">
+      <label>HUB ROOT PATH</label>
+      <input type="text" id="portal-hub-root" placeholder="/hub-data"/>
+    </div>
+    <div class="error-msg" id="portal-error"></div>
+    <div class="modal-actions">
+      <button class="btn sm danger" onclick="closeModal('modal-create-portal')"><span>CANCEL</span></button>
+      <button class="btn sm purple" id="portal-submit" onclick="doCreatePortal()"><span>CREATE PORTAL</span></button>
+    </div>
+  </div>
+</div>
+
+<!-- Manage Users -->
+<div class="modal-overlay" id="modal-users">
+  <div class="modal" style="width:540px">
+    <div class="modal-title">MANAGE USERS</div>
+    <div id="users-table-wrap" style="border:1px solid var(--border);max-height:260px;overflow-y:auto;margin-bottom:18px">
+      <div style="padding:10px 12px;font-family:var(--mono);font-size:12px;color:var(--text-dim)">Loading...</div>
+    </div>
+    <hr class="divider">
+    <div style="font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:2px;margin-bottom:12px">CREATE NEW USER</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:10px;align-items:flex-end">
+      <div class="field" style="margin:0"><label>USERNAME</label><input type="text" id="new-user-name" placeholder="jsmith"/></div>
+      <div class="field" style="margin:0"><label>PASSWORD</label><input type="password" id="new-user-pass" placeholder="••••••••"/></div>
+      <div class="field" style="margin:0">
+        <label>ROLE</label>
+        <select id="new-user-role">
+          <option value="monitor">monitor</option>
+          <option value="portal_manager">portal_manager</option>
+        </select>
+      </div>
+      <button class="btn sm" onclick="doCreateUser()" style="margin-bottom:0"><span>CREATE</span></button>
+    </div>
+    <div class="error-msg" id="users-error"></div>
+    <div class="modal-actions"><button class="btn sm danger" onclick="closeModal('modal-users')"><span>CLOSE</span></button></div>
+  </div>
+</div>
+
+<script>
+// ══ CONFIG ═════════════════════════════════════════════════════════════
+const PROXY = window.location.origin;
+
+// ══ APP STATE ══════════════════════════════════════════════════════════
+let S = {
+  sessionToken:    null,
+  username:        null,
+  role:            null,
+  isAdmin:         false,
+  canPortals:      false,
+  spokes:          [],
+  hubs:            [],
+  activeTab:       'spokes',
+  countdown:       30,
+  countdownInt:    null,
+  // pending auth context
+  authType:        null,   // 'spoke' | 'hub'
+  authId:          null,
+  authExpired:     false,
+};
+
+// ══ UTILS ══════════════════════════════════════════════════════════════
+function fmt(b) {
+  b = parseInt(b)||0;
+  if (b >= 1099511627776) return (b/1099511627776).toFixed(2)+' TB';
+  if (b >= 1073741824)    return (b/1073741824).toFixed(2)+' GB';
+  if (b >= 1048576)       return (b/1048576).toFixed(1)+' MB';
+  return b+' B';
+}
+function pct(a,t)  { return t ? Math.min(100, a/t*100) : 0; }
+function barCol(p) { return p>85?'var(--danger)':p>65?'var(--warn)':'var(--ok)'; }
+function cardCls(p){ return p>85?'danger':p>65?'warn':'ok'; }
+function fmtDate(s){ if(!s) return '—'; try{return new Date(s).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});}catch{return s;} }
+function nowStr()  { return new Date().toLocaleTimeString('en-US',{hour12:false}); }
+function esc(s)    { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function showErr(el, msg){ el.textContent='⚠ '+msg; el.style.display='block'; }
+function closeModal(id){ document.getElementById(id).classList.remove('open'); }
+
+function log(msg, type='info'){
+  const body = document.getElementById('log-body');
+  const el   = document.createElement('div');
+  el.className = 'log-entry';
+  el.innerHTML = '<span class="log-time">'+nowStr()+'</span><span class="log-msg '+type+'">'+msg+'</span>';
+  body.prepend(el);
+}
+
+// ══ API ════════════════════════════════════════════════════════════════
+async function api(path, method, body, auth=true){
+  const headers = {'Content-Type':'application/json'};
+  if(auth && S.sessionToken) headers['Authorization'] = 'Bearer '+S.sessionToken;
+  const opts = {method: method||'GET', headers};
+  if(body) opts.body = JSON.stringify(body);
+  let res;
+  try { res = await fetch(PROXY+path, opts); }
+  catch(e){ throw new Error('Cannot reach proxy at '+PROXY+' — is proxy.py running?'); }
+  const data = await res.json().catch(()=>({}));
+  if(res.status===401){ log('Session expired','warn'); doForceLogout(); throw new Error('Session expired'); }
+  if(!res.ok) throw new Error(data.error||data.description||data.__proxy_error||('HTTP '+res.status));
+  return data;
+}
+
+async function proxyCall(host, apiPath, method, spokeId, hubId){
+  return api('/proxy','POST',{host, path:apiPath, method:method||'GET', spoke_id:spokeId||'', hub_id:hubId||''});
+}
+
+// ══ LOGIN / LOGOUT ═════════════════════════════════════════════════════
+function showScreen(id){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+async function doAppLogin(){
+  const username = document.getElementById('login-username').value.trim();
+  const password = document.getElementById('login-password').value;
+  const btn      = document.getElementById('login-btn');
+  const errEl    = document.getElementById('login-error');
+  if(!username||!password){ showErr(errEl,'Please enter username and password.'); return; }
+  btn.disabled=true; document.getElementById('login-btn-text').textContent='SIGNING IN...';
+  errEl.style.display='none';
+  try{
+    const d = await api('/app/login','POST',{username,password},false);
+    S.sessionToken = d.session_token;
+    S.username     = d.username;
+    S.role         = d.role;
+    S.isAdmin      = d.is_admin||false;
+    S.canPortals   = d.can_manage_portals||false;
+    document.getElementById('topbar-user').textContent  = d.username;
+    document.getElementById('topbar-role').textContent  = d.role;
+    document.getElementById('topbar-role').className    = 'role-badge '+d.role;
+    document.getElementById('btn-manage-users').style.display = S.isAdmin?'':'none';
+    // Show hub/portal tabs for portal managers and admins
+    document.getElementById('tab-hubs').style.display    = S.canPortals?'':'none';
+    document.getElementById('tab-portals').style.display = S.canPortals?'':'none';
+    log('Signed in as '+d.username+' ('+d.role+')','ok');
+    showScreen('screen-dashboard');
+    doRefresh();
+    startRefresh();
+  }catch(e){ showErr(errEl,e.message); }
+  finally{ btn.disabled=false; document.getElementById('login-btn-text').textContent='SIGN IN'; }
+}
+
+function doAppLogout(){ api('/app/logout','POST',{},true).catch(()=>{}); doForceLogout(); }
+function doForceLogout(){
+  clearInterval(S.countdownInt);
+  S = { sessionToken:null,username:null,role:null,isAdmin:false,canPortals:false,
+        spokes:[],hubs:[],activeTab:'spokes',countdown:30,countdownInt:null,
+        authType:null,authId:null,authExpired:false };
+  document.getElementById('login-password').value='';
+  showScreen('screen-login');
+}
+
+// ══ TABS ═══════════════════════════════════════════════════════════════
+function switchTab(tab){
+  S.activeTab = tab;
+  ['spokes','hubs','portals'].forEach(t=>{
+    document.getElementById('tab-'+t).classList.toggle('active', t===tab);
+    document.getElementById('panel-'+t).style.display = t===tab?'':'none';
+  });
+  if(tab==='portals') renderPortalsTab();
+}
+
+// ══ REFRESH ════════════════════════════════════════════════════════════
+function startRefresh(){
+  S.countdown=30; updateCountdown();
+  S.countdownInt = setInterval(()=>{
+    S.countdown--;
+    updateCountdown();
+    if(S.countdown<=0){ S.countdown=30; doRefresh(); }
+  },1000);
+}
+function updateCountdown(){
+  const el=document.getElementById('countdown-num');
+  const fill=document.getElementById('refresh-fill');
+  if(el)   el.textContent=S.countdown;
+  if(fill) fill.style.width=(S.countdown/30*100)+'%';
+}
+async function doRefresh(){
+  await fetchSpokes();
+  if(S.canPortals) await fetchHubs();
+  if(S.activeTab==='portals') renderPortalsTab();
+}
+
+// ══ SPOKES ═════════════════════════════════════════════════════════════
+async function fetchSpokes(){
+  try{
+    const d = await api('/app/spokes','GET',null,true);
+    S.spokes = d.spokes||[];
+    await Promise.all(S.spokes.map(fetchSpokeData));
+    renderSpokesPanel();
+  }catch(e){ log('Spokes error: '+e.message,'err'); }
+}
+
+async function fetchSpokeData(spoke){
+  if(!spoke.has_token||spoke.token_expired) return;
+  try{
+    const [fs, pf, ps] = await Promise.all([
+      proxyCall(spoke.host,'/v1/file-system','GET',spoke.id,''),
+      proxyCall(spoke.host,'/v1/portal/file-systems/','GET',spoke.id,''),
+      proxyCall(spoke.host,'/v1/portal/spokes/','GET',spoke.id,''),
+    ]);
+    spoke.totalCap  = parseInt(fs.total_size_bytes||0);
+    spoke.totalFree = parseInt(fs.free_size_bytes||0);
+    spoke.totalUsed = spoke.totalCap - spoke.totalFree;
+    const spokeMap  = {};
+    (pf.entries||pf||[]).forEach(e=>{ if(e.spoke_root_path) spokeMap[e.uuid]=e; });
+    const fsArr = Array.isArray(pf)?pf:(pf.entries||[]);
+    const spArr = (ps.entries||[]);
+    // merge by uuid
+    spoke.portalRows = fsArr.map(f=>{
+      const sp = spArr.find(s=>s.hub_cluster_uuid===f.uuid)||{};
+      return { uuid:f.uuid, usedBytes:parseInt(f.usage_bytes||0),
+               spokePath:sp.spoke_root_path||'—', hubAddr:sp.hub_address||'—',
+               status:sp.status||'—', state:sp.state||'—', spokeType:sp.spoke_type||'—',
+               spokeEntryId: sp.id||'' };
+    });
+    spoke.fetchError = null;
+  }catch(e){
+    spoke.fetchError = e.message;
+  }
+}
+
+function renderSpokesPanel(){
+  const p = document.getElementById('panel-spokes');
+  const addBtn = '<button class="btn sm" onclick="openAddSpoke()"><span>+ ADD SPOKE</span></button>';
+  let html = '<div style="display:flex;justify-content:flex-end;margin-bottom:14px">'+addBtn+'</div>';
+  if(!S.spokes.length){
+    html += '<div class="empty-state"><div style="font-size:36px;opacity:0.2;margin-bottom:12px">⬡</div>No spokes added yet.</div>';
+    p.innerHTML=html; return;
+  }
+  html += '<div class="cards-grid">'+S.spokes.map(renderSpokeCard).join('')+'</div>';
+  p.innerHTML=html;
+}
+
+function renderSpokeCard(spoke){
+  if(!spoke.has_token||spoke.token_expired) return renderClusterNoAuth(spoke,'spoke');
+  if(spoke.fetchError) return renderClusterError(spoke,'spoke');
+  const used = spoke.totalUsed||0, cap = spoke.totalCap||0;
+  const p    = pct(used,cap);
+  const col  = barCol(p);
+  const cls  = cardCls(p);
+  const pRows = (spoke.portalRows||[]).map(r=>{
+    const stCol = r.status==='ACTIVE'?'var(--ok)':r.status==='DEGRADED'?'var(--warn)':'var(--text-dim)';
+    return '<div style="margin-bottom:8px">'
+      +'<div style="display:flex;justify-content:space-between;align-items:baseline">'
+      +'<span style="font-family:var(--cond);font-size:13px;font-weight:700;color:var(--text-bright)">'+esc(r.spokePath)+'</span>'
+      +'<span style="font-family:var(--mono);font-size:11px;color:'+barCol(pct(r.usedBytes,cap))+'">'+fmt(r.usedBytes)+'</span>'
+      +'</div>'
+      +'<div class="usage-bar-track"><div class="usage-bar-fill" style="width:'+pct(r.usedBytes,cap).toFixed(1)+'%;background:'+barCol(pct(r.usedBytes,cap))+'"></div></div>'
+      +'<div style="font-family:var(--mono);font-size:10px;color:var(--text-dim)">'
+      +esc(r.spokeType)+' · hub: '+esc(r.hubAddr)+' <span style="color:'+stCol+'">'+esc(r.status)+'</span>'
+      +'</div></div>';
+  }).join('');
+
+  return '<div class="cluster-card">'
+    +'<div class="cluster-card-stripe" style="background:'+col+'"></div>'
+    +'<div class="cluster-card-header">'
+    +'<div><div class="cluster-card-name">'+esc(spoke.name)+'</div><div class="cluster-card-host">'+esc(spoke.host)+'</div></div>'
+    +'<span class="status-badge '+cls+'">'+( p>85?'CRITICAL':p>65?'WARN':'HEALTHY')+'</span>'
+    +'</div>'
+    +'<div class="cluster-card-body">'
+    +'<div style="display:flex;justify-content:space-between;align-items:baseline">'
+    +'<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">CAPACITY</span>'
+    +'<span style="font-family:var(--cond);font-size:16px;font-weight:700;color:var(--accent)">'+fmt(cap)+'</span>'
+    +'</div>'
+    +'<div style="display:flex;justify-content:space-between;margin-top:2px">'
+    +'<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">USED</span>'
+    +'<span style="font-family:var(--mono);font-size:12px;color:'+col+'">'+fmt(used)+' ('+p.toFixed(1)+'%)</span>'
+    +'</div>'
+    +'<div class="usage-bar-track"><div class="usage-bar-fill" style="width:'+p.toFixed(1)+'%;background:'+col+'"></div></div>'
+    +(pRows?'<div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">'
+      +'<div style="font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:1px;margin-bottom:8px">PORTAL FILE SYSTEMS</div>'
+      +pRows+'</div>':'')
+    +'<div class="meta-row"><div>TOKEN EXP <span>'+fmtDate(spoke.token_expires)+'</span></div></div>'
+    +'</div>'
+    +'<div class="cluster-card-actions">'
+    +'<button class="btn xs warn" onclick="openAuth(\'spoke\',\''+spoke.id+'\',false)"><span>🔑 RE-AUTH</span></button>'
+    +'<button class="btn xs danger" onclick="doRemoveCluster(\'spoke\',\''+spoke.id+'\')"><span>REMOVE</span></button>'
+    +'</div></div>';
+}
+
+// ══ HUBS ═══════════════════════════════════════════════════════════════
+async function fetchHubs(){
+  try{
+    const d = await api('/app/hubs','GET',null,true);
+    S.hubs = d.hubs||[];
+    await Promise.all(S.hubs.map(fetchHubData));
+    renderHubsPanel();
+  }catch(e){ log('Hubs error: '+e.message,'err'); }
+}
+
+async function fetchHubData(hub){
+  if(!hub.has_token||hub.token_expired) return;
+  try{
+    const fs = await proxyCall(hub.host,'/v1/file-system','GET','',hub.id);
+    hub.totalCap  = parseInt(fs.total_size_bytes||0);
+    hub.totalFree = parseInt(fs.free_size_bytes||0);
+    hub.totalUsed = hub.totalCap - hub.totalFree;
+    hub.fetchError = null;
+  }catch(e){ hub.fetchError = e.message; }
+}
+
+function renderHubsPanel(){
+  const p = document.getElementById('panel-hubs');
+  const addBtn = '<button class="btn sm purple" onclick="openAddHub()"><span>+ ADD HUB</span></button>';
+  let html = '<div style="display:flex;justify-content:flex-end;margin-bottom:14px">'+addBtn+'</div>';
+  if(!S.hubs.length){
+    html += '<div class="empty-state"><div style="font-size:36px;opacity:0.2;margin-bottom:12px">◈</div>No hubs added yet.</div>';
+    p.innerHTML=html; return;
+  }
+  html += '<div class="cards-grid">'+S.hubs.map(h=>renderHubCard(h)).join('')+'</div>';
+  p.innerHTML=html;
+}
+
+function renderHubCard(hub){
+  if(!hub.has_token||hub.token_expired) return renderClusterNoAuth(hub,'hub');
+  if(hub.fetchError) return renderClusterError(hub,'hub');
+  const used=hub.totalUsed||0, cap=hub.totalCap||0;
+  const p=pct(used,cap), col=barCol(p), cls=cardCls(p);
+  return '<div class="cluster-card">'
+    +'<div class="cluster-card-stripe" style="background:var(--purple)"></div>'
+    +'<div class="cluster-card-header">'
+    +'<div><div class="cluster-card-name">'+esc(hub.name)+'</div><div class="cluster-card-host">'+esc(hub.host)+'</div></div>'
+    +'<span class="status-badge" style="color:var(--purple);border-color:var(--purple)">HUB</span>'
+    +'</div>'
+    +'<div class="cluster-card-body">'
+    +'<div style="display:flex;justify-content:space-between;align-items:baseline">'
+    +'<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">CAPACITY</span>'
+    +'<span style="font-family:var(--cond);font-size:16px;font-weight:700;color:var(--purple)">'+fmt(cap)+'</span>'
+    +'</div>'
+    +'<div style="display:flex;justify-content:space-between;margin-top:2px">'
+    +'<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">USED</span>'
+    +'<span style="font-family:var(--mono);font-size:12px;color:'+col+'">'+fmt(used)+' ('+p.toFixed(1)+'%)</span>'
+    +'</div>'
+    +'<div class="usage-bar-track"><div class="usage-bar-fill" style="width:'+p.toFixed(1)+'%;background:'+col+'"></div></div>'
+    +'<div class="meta-row"><div>TOKEN EXP <span>'+fmtDate(hub.token_expires)+'</span></div></div>'
+    +'</div>'
+    +'<div class="cluster-card-actions">'
+    +'<button class="btn xs warn" onclick="openAuth(\'hub\',\''+hub.id+'\',false)"><span>🔑 RE-AUTH</span></button>'
+    +'<button class="btn xs danger" onclick="doRemoveCluster(\'hub\',\''+hub.id+'\')"><span>REMOVE</span></button>'
+    +'</div></div>';
+}
+
+// ══ PORTALS TAB ════════════════════════════════════════════════════════
+async function renderPortalsTab(){
+  const p = document.getElementById('panel-portals');
+  const canCreate = S.canPortals;
+  let html = '<div class="portal-section-header">'
+    +'<span class="section-title">PORTAL RELATIONSHIPS</span>'
+    +(canCreate?'<button class="btn sm purple" onclick="openCreatePortal()"><span>+ CREATE PORTAL</span></button>':'')
+    +'</div>';
+
+  // Collect all portal rows from spoke data
+  const rows = [];
+  for(const spoke of S.spokes){
+    if(!spoke.portalRows) continue;
+    for(const r of spoke.portalRows){
+      rows.push({...r, spokeName:spoke.name, spokeHost:spoke.host, spokeId:spoke.id});
+    }
+  }
+
+  if(!rows.length){
+    html += '<div class="empty-state"><div style="font-size:36px;opacity:0.2;margin-bottom:12px">⬡</div>'
+      +(S.spokes.some(s=>s.has_token&&!s.token_expired)
+        ?'No portal relationships found on authenticated spokes.'
+        :'Add and authenticate spoke clusters to view portal relationships.')
+      +'</div>';
+    p.innerHTML=html; return;
+  }
+
+  html += '<div style="overflow-x:auto"><table class="portal-table">'
+    +'<thead><tr>'
+    +'<th>SPOKE CLUSTER</th><th>SPOKE PATH</th><th>HUB ADDRESS</th>'
+    +'<th>TYPE</th><th>STATE</th><th>STATUS</th><th>USED</th>'
+    +(canCreate?'<th></th>':'')
+    +'</tr></thead><tbody>'
+    +rows.map(r=>{
+      const stCol = r.status==='ACTIVE'?'var(--ok)':r.status==='DEGRADED'?'var(--warn)':'var(--text-dim)';
+      const delBtn = canCreate && r.spokeEntryId
+        ?'<button class="btn xs danger" onclick="doDeletePortal(\''+esc(r.spokeId)+'\',\''+esc(r.spokeEntryId)+'\')"><span>DELETE</span></button>':
+        (canCreate?'<span class="dim">—</span>':'');
+      return '<tr>'
+        +'<td>'+esc(r.spokeName)+'<div class="dim" style="font-size:10px">'+esc(r.spokeHost)+'</div></td>'
+        +'<td>'+esc(r.spokePath)+'</td>'
+        +'<td>'+esc(r.hubAddr)+'</td>'
+        +'<td class="dim">'+esc(r.spokeType)+'</td>'
+        +'<td class="dim">'+esc(r.state)+'</td>'
+        +'<td><span style="color:'+stCol+'">'+esc(r.status)+'</span></td>'
+        +'<td>'+fmt(r.usedBytes)+'</td>'
+        +(canCreate?'<td>'+delBtn+'</td>':'')
+        +'</tr>';
+    }).join('')
+    +'</tbody></table></div>';
+
+  p.innerHTML=html;
+}
+
+// ══ SHARED CLUSTER HELPERS ═════════════════════════════════════════════
+function renderClusterNoAuth(c, type){
+  const expired = c.token_expired && c.has_token;
+  const label   = expired?'TOKEN EXPIRED':'NOT AUTHENTICATED';
+  const msg     = expired?'Token expired '+fmtDate(c.token_expires)+'. Re-authenticate to resume.':'No credentials stored. Authenticate to connect.';
+  const col     = type==='hub'?'var(--purple)':'var(--border-bright)';
+  return '<div class="cluster-card">'
+    +'<div class="cluster-card-stripe" style="background:'+col+'"></div>'
+    +'<div class="cluster-card-header">'
+    +'<div><div class="cluster-card-name">'+esc(c.name)+'</div><div class="cluster-card-host">'+esc(c.host)+'</div></div>'
+    +'<span class="status-badge dim">'+label+'</span>'
+    +'</div>'
+    +'<div class="noauth-body">'+msg+'</div>'
+    +'<div class="cluster-card-actions">'
+    +'<button class="btn xs" onclick="openAuth(\''+type+'\',\''+c.id+'\','+expired+')"><span>🔑 AUTHENTICATE</span></button>'
+    +'<button class="btn xs danger" onclick="doRemoveCluster(\''+type+'\',\''+c.id+'\')"><span>REMOVE</span></button>'
+    +'</div></div>';
+}
+
+function renderClusterError(c, type){
+  return '<div class="cluster-card">'
+    +'<div class="cluster-card-stripe" style="background:var(--danger)"></div>'
+    +'<div class="cluster-card-header">'
+    +'<div><div class="cluster-card-name">'+esc(c.name)+'</div><div class="cluster-card-host">'+esc(c.host)+'</div></div>'
+    +'<span class="status-badge danger">ERROR</span>'
+    +'</div>'
+    +'<div class="noauth-body" style="color:var(--danger)">'+esc(c.fetchError)+'</div>'
+    +'<div class="cluster-card-actions">'
+    +'<button class="btn xs warn" onclick="openAuth(\''+type+'\',\''+c.id+'\',false)"><span>🔑 RE-AUTH</span></button>'
+    +'<button class="btn xs danger" onclick="doRemoveCluster(\''+type+'\',\''+c.id+'\')"><span>REMOVE</span></button>'
+    +'</div></div>';
+}
+
+// ══ ADD SPOKE ══════════════════════════════════════════════════════════
+function openAddSpoke(){
+  document.getElementById('add-spoke-name').value='';
+  document.getElementById('add-spoke-host').value='';
+  document.getElementById('add-spoke-error').style.display='none';
+  document.getElementById('modal-add-spoke').classList.add('open');
+  document.getElementById('add-spoke-name').focus();
+}
+async function doAddSpoke(){
+  const name=document.getElementById('add-spoke-name').value.trim();
+  const host=document.getElementById('add-spoke-host').value.trim();
+  const err=document.getElementById('add-spoke-error');
+  if(!host){ showErr(err,'Host is required.'); return; }
+  try{
+    const d=await api('/app/spokes','POST',{name,host},true);
+    log('Added spoke: '+d.name,'ok');
+    closeModal('modal-add-spoke');
+    S.spokes.push({id:d.id,name:d.name,host:d.host,has_token:false,token_expired:false});
+    renderSpokesPanel();
+    openAuth('spoke',d.id,false);
+  }catch(e){ showErr(err,e.message); }
+}
+
+// ══ ADD HUB ════════════════════════════════════════════════════════════
+function openAddHub(){
+  document.getElementById('add-hub-name').value='';
+  document.getElementById('add-hub-host').value='';
+  document.getElementById('add-hub-error').style.display='none';
+  document.getElementById('modal-add-hub').classList.add('open');
+  document.getElementById('add-hub-name').focus();
+}
+async function doAddHub(){
+  const name=document.getElementById('add-hub-name').value.trim();
+  const host=document.getElementById('add-hub-host').value.trim();
+  const err=document.getElementById('add-hub-error');
+  if(!host){ showErr(err,'Host is required.'); return; }
+  try{
+    const d=await api('/app/hubs','POST',{name,host},true);
+    log('Added hub: '+d.name,'ok');
+    closeModal('modal-add-hub');
+    S.hubs.push({id:d.id,name:d.name,host:d.host,has_token:false,token_expired:false});
+    renderHubsPanel();
+    openAuth('hub',d.id,false);
+  }catch(e){ showErr(err,e.message); }
+}
+
+// ══ AUTH ═══════════════════════════════════════════════════════════════
+function openAuth(type, id, isExpired){
+  const list   = type==='spoke'?S.spokes:S.hubs;
+  const item   = list.find(x=>x.id===id);
+  if(!item) return;
+  S.authType    = type;
+  S.authId      = id;
+  S.authExpired = isExpired;
+  document.getElementById('auth-title').textContent = 'AUTHENTICATE '+(type==='spoke'?'SPOKE':'HUB')+': '+item.name.toUpperCase();
+  document.getElementById('auth-subtitle').textContent = 'Enter Qumulo credentials for '+item.host+'. A token will be stored for 30 days. Credentials are never saved.';
+  document.getElementById('auth-token-warning').style.display = isExpired?'block':'none';
+  document.getElementById('auth-password').value='';
+  document.getElementById('auth-error').style.display='none';
+  document.getElementById('modal-auth').classList.add('open');
+  document.getElementById('auth-password').focus();
+}
+async function doAuth(){
+  const username = document.getElementById('auth-username').value.trim();
+  const password = document.getElementById('auth-password').value;
+  const btn      = document.getElementById('auth-submit');
+  const err      = document.getElementById('auth-error');
+  if(!username||!password){ showErr(err,'Username and password required.'); return; }
+  btn.disabled=true; btn.querySelector('span').textContent='AUTHENTICATING...';
+  err.style.display='none';
+  try{
+    const endpoint = S.authType==='spoke'?'/app/spokes/':'/app/hubs/';
+    const d = await api(endpoint+S.authId+'/auth','POST',{username,password},true);
+    log((S.authType==='spoke'?'Spoke':'Hub')+' authenticated, expires '+fmtDate(d.token_expires),'ok');
+    closeModal('modal-auth');
+    await doRefresh();
+  }catch(e){ showErr(err,e.message); }
+  finally{ btn.disabled=false; btn.querySelector('span').textContent='AUTHENTICATE'; }
+}
+
+// ══ REMOVE CLUSTER ═════════════════════════════════════════════════════
+async function doRemoveCluster(type, id){
+  const list  = type==='spoke'?S.spokes:S.hubs;
+  const item  = list.find(x=>x.id===id);
+  if(!item) return;
+  if(!confirm('Remove '+(type==='spoke'?'spoke':'hub')+' "'+item.name+'"?')) return;
+  try{
+    await api('/app/'+(type==='spoke'?'spokes':'hubs')+'/'+id,'DELETE',null,true);
+    log('Removed '+(type==='spoke'?'spoke':'hub')+': '+item.name,'warn');
+    await doRefresh();
+  }catch(e){ log('Remove error: '+e.message,'err'); }
+}
+
+// ══ CREATE PORTAL ══════════════════════════════════════════════════════
+function openCreatePortal(){
+  // Populate selects
+  const ss = document.getElementById('portal-spoke-select');
+  const hs = document.getElementById('portal-hub-select');
+  ss.innerHTML = S.spokes.filter(s=>s.has_token&&!s.token_expired)
+    .map(s=>'<option value="'+s.id+'">'+esc(s.name)+' ('+esc(s.host)+')</option>').join('');
+  hs.innerHTML = S.hubs.filter(h=>h.has_token&&!h.token_expired)
+    .map(h=>'<option value="'+h.id+'">'+esc(h.name)+' ('+esc(h.host)+')</option>').join('');
+  if(!ss.innerHTML) ss.innerHTML='<option value="">— No authenticated spokes —</option>';
+  if(!hs.innerHTML) hs.innerHTML='<option value="">— No authenticated hubs —</option>';
+  document.getElementById('portal-spoke-root').value='';
+  document.getElementById('portal-hub-root').value='';
+  document.getElementById('portal-error').style.display='none';
+  document.getElementById('modal-create-portal').classList.add('open');
+}
+async function doCreatePortal(){
+  const spoke_id   = document.getElementById('portal-spoke-select').value;
+  const hub_id     = document.getElementById('portal-hub-select').value;
+  const spoke_root = document.getElementById('portal-spoke-root').value.trim();
+  const hub_root   = document.getElementById('portal-hub-root').value.trim();
+  const btn        = document.getElementById('portal-submit');
+  const err        = document.getElementById('portal-error');
+  if(!spoke_id||!hub_id||!spoke_root||!hub_root){ showErr(err,'All fields are required.'); return; }
+  btn.disabled=true; btn.querySelector('span').textContent='CREATING...';
+  err.style.display='none';
+  try{
+    await api('/app/portals','POST',{spoke_id,hub_id,spoke_root,hub_root},true);
+    log('Portal created: '+spoke_root+' → '+hub_root,'ok');
+    closeModal('modal-create-portal');
+    await doRefresh();
+    switchTab('portals');
+  }catch(e){ showErr(err,e.message); }
+  finally{ btn.disabled=false; btn.querySelector('span').textContent='CREATE PORTAL'; }
+}
+
+async function doDeletePortal(spokeId, portalId){
+  const spoke = S.spokes.find(s=>s.id===spokeId);
+  if(!confirm('Delete portal relationship "'+portalId+'" on spoke '+(spoke?spoke.name:spokeId)+'?\nThis cannot be undone.')) return;
+  try{
+    await api('/app/portals/'+spokeId+'/'+portalId,'DELETE',null,true);
+    log('Portal deleted: '+portalId,'warn');
+    await doRefresh();
+  }catch(e){ log('Delete portal error: '+e.message,'err'); }
+}
+
+// ══ USER MANAGEMENT ════════════════════════════════════════════════════
+async function doUsersOpen(){
+  document.getElementById('new-user-name').value='';
+  document.getElementById('new-user-pass').value='';
+  document.getElementById('new-user-role').value='monitor';
+  document.getElementById('users-error').style.display='none';
+  document.getElementById('modal-users').classList.add('open');
+  await loadUsersTable();
+}
+async function loadUsersTable(){
+  const wrap = document.getElementById('users-table-wrap');
+  wrap.innerHTML='<div style="padding:10px 12px;font-family:var(--mono);font-size:12px;color:var(--text-dim)">Loading...</div>';
+  try{
+    const d = await api('/app/users','GET',null,true);
+    const users = d.users||[];
+    if(!users.length){ wrap.innerHTML='<div style="padding:10px 12px;font-family:var(--mono);font-size:12px;color:var(--text-dim)">No users.</div>'; return; }
+    wrap.innerHTML='<table class="users-table"><thead><tr><th>USERNAME</th><th>ROLE</th><th>CREATED</th><th></th></tr></thead><tbody>'
+      +users.map(u=>{
+        const roleBadge = '<span class="role-badge '+u.role+'" style="font-size:10px">'+esc(u.role)+'</span>';
+        const actions = u.built_in
+          ? '<span style="font-family:var(--mono);font-size:10px;color:var(--accent);border:1px solid var(--accent);padding:2px 6px">BUILT-IN</span>'
+          : '<div style="display:flex;gap:6px">'
+            +'<select onchange="doChangeRole(\''+esc(u.username)+'\',this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:11px;padding:3px 6px">'
+            +'<option value="monitor"'+(u.role==='monitor'?' selected':'')+'>monitor</option>'
+            +'<option value="portal_manager"'+(u.role==='portal_manager'?' selected':'')+'>portal_manager</option>'
+            +'</select>'
+            +'<button class="btn xs danger" onclick="doDeleteUser(\''+esc(u.username)+'\')"><span>DEL</span></button>'
+            +'</div>';
+        return '<tr><td style="color:var(--text-bright);font-weight:700">'+esc(u.username)+'</td><td>'+roleBadge+'</td><td class="dim">'+fmtDate(u.created)+'</td><td>'+actions+'</td></tr>';
+      }).join('')
+      +'</tbody></table>';
+  }catch(e){
+    wrap.innerHTML='<div style="padding:10px 12px;font-family:var(--mono);font-size:12px;color:var(--danger)">Error: '+esc(e.message)+'</div>';
+  }
+}
+async function doCreateUser(){
+  const username=document.getElementById('new-user-name').value.trim();
+  const password=document.getElementById('new-user-pass').value;
+  const role    =document.getElementById('new-user-role').value;
+  const err     =document.getElementById('users-error');
+  err.style.display='none';
+  if(!username||!password){ showErr(err,'Username and password required.'); return; }
+  try{
+    await api('/app/users','POST',{username,password,role},true);
+    log('Created user: '+username+' ('+role+')','ok');
+    document.getElementById('new-user-name').value='';
+    document.getElementById('new-user-pass').value='';
+    await loadUsersTable();
+  }catch(e){ showErr(err,e.message); }
+}
+async function doChangeRole(username, role){
+  try{
+    await api('/app/users/'+encodeURIComponent(username),'PATCH',{role},true);
+    log('Updated '+username+' role → '+role,'ok');
+    await loadUsersTable();
+  }catch(e){ log('Role update error: '+e.message,'err'); }
+}
+async function doDeleteUser(username){
+  if(!confirm('Delete user "'+username+'"? Their cluster configurations will also be removed.')) return;
+  try{
+    await api('/app/users/'+encodeURIComponent(username),'DELETE',null,true);
+    log('Deleted user: '+username,'warn');
+    await loadUsersTable();
+  }catch(e){ log('Delete user error: '+e.message,'err'); }
+}
+
+// ══ KEYBOARD ═══════════════════════════════════════════════════════════
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){
+    ['modal-add-spoke','modal-add-hub','modal-auth','modal-create-portal','modal-users']
+      .forEach(id=>document.getElementById(id).classList.remove('open'));
+  }
+});
+document.getElementById('login-password').addEventListener('keydown',e=>{ if(e.key==='Enter') doAppLogin(); });
+document.getElementById('auth-password').addEventListener('keydown',e=>{ if(e.key==='Enter') doAuth(); });
+document.getElementById('add-spoke-host').addEventListener('keydown',e=>{ if(e.key==='Enter') doAddSpoke(); });
+document.getElementById('add-hub-host').addEventListener('keydown',e=>{ if(e.key==='Enter') doAddHub(); });
+
+// ══ INIT ═══════════════════════════════════════════════════════════════
+showScreen('screen-login');
+document.getElementById('login-username').focus();
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+[Unit]
+Description=CDF Manager Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/cdf_manager
+ExecStart=/usr/bin/python3 /var/www/cdf_manager/proxy.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
