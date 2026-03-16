@@ -298,6 +298,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
     <div class="top-bar-right">
       <div class="user-badge">Signed in as <span class="uname" id="topbar-user">—</span></div>
       <span class="role-badge" id="topbar-role">—</span>
+      <button class="btn sm" onclick="doChangePwOpen()"><span>🔑 PASSWORD</span></button>
       <button class="btn sm purple" id="btn-manage-users" onclick="doUsersOpen()" style="display:none"><span>⚙ USERS</span></button>
       <button class="btn sm danger" onclick="doAppLogout()"><span>SIGN OUT</span></button>
     </div>
@@ -432,6 +433,31 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
   </div>
 </div>
 
+<!-- Change Password Modal -->
+<div class="modal-overlay" id="modal-change-pw">
+  <div class="modal">
+    <div class="modal-title" id="change-pw-title">CHANGE PASSWORD</div>
+    <div class="modal-subtitle" id="change-pw-subtitle">Enter your current password and choose a new one.</div>
+    <div class="field" id="change-pw-old-wrap">
+      <label>CURRENT PASSWORD</label>
+      <input type="password" id="change-pw-old" placeholder="••••••••"/>
+    </div>
+    <div class="field">
+      <label>NEW PASSWORD</label>
+      <input type="password" id="change-pw-new" placeholder="••••••••"/>
+    </div>
+    <div class="field">
+      <label>CONFIRM NEW PASSWORD</label>
+      <input type="password" id="change-pw-confirm" placeholder="••••••••"/>
+    </div>
+    <div class="error-msg" id="change-pw-error"></div>
+    <div class="modal-actions">
+      <button class="btn sm danger" onclick="closeModal('modal-change-pw')"><span>CANCEL</span></button>
+      <button class="btn sm" id="change-pw-submit" onclick="doChangePassword()"><span>CHANGE PASSWORD</span></button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ══ CONFIG ═════════════════════════════════════════════════════════════
 const PROXY = window.location.origin;
@@ -489,7 +515,10 @@ async function api(path, method, body, auth=true){
   try { res = await fetch(PROXY+path, opts); }
   catch(e){ throw new Error('Cannot reach proxy at '+PROXY+' — is proxy.py running?'); }
   const data = await res.json().catch(()=>({}));
-  if(res.status===401){ log('Session expired','warn'); doForceLogout(); throw new Error('Session expired'); }
+  // Only treat 401 as session expiry on authenticated calls — not on login itself
+  if(res.status===401 && auth && path !== '/app/login'){
+    log('Session expired','warn'); doForceLogout(); throw new Error('Session expired');
+  }
   if(!res.ok) throw new Error(data.error||data.description||data.__proxy_error||('HTTP '+res.status));
   return data;
 }
@@ -570,8 +599,13 @@ function updateCountdown(){
   if(fill) fill.style.width=(S.countdown/30*100)+'%';
 }
 async function doRefresh(){
+  // Fetch spokes first — this may auto-register new hubs discovered via portal data.
+  // Then re-fetch hubs from server so newly registered ones appear with correct state.
   await fetchSpokes();
-  if(S.canPortals) await fetchHubs();
+  if(S.canPortals){
+    await fetchHubs();     // picks up any hubs auto-registered during fetchSpokes
+    renderHubsPanel();
+  }
   if(S.activeTab==='portals') renderPortalsTab();
 }
 
@@ -597,17 +631,43 @@ async function fetchSpokeData(spoke){
     spoke.totalFree = parseInt(fs.free_size_bytes||0);
     spoke.totalUsed = spoke.totalCap - spoke.totalFree;
     const spokeMap  = {};
-    (pf.entries||pf||[]).forEach(e=>{ if(e.spoke_root_path) spokeMap[e.uuid]=e; });
-    const fsArr = Array.isArray(pf)?pf:(pf.entries||[]);
-    const spArr = (ps.entries||[]);
+    const fsArr = Array.isArray(pf) ? pf : (Array.isArray(pf.entries) ? pf.entries : []);
+    const spArr = Array.isArray(ps) ? ps : (Array.isArray(ps.entries) ? ps.entries : []);
+    spArr.forEach(e=>{ if(e.hub_cluster_uuid) spokeMap[e.hub_cluster_uuid]=e; });
     // merge by uuid
     spoke.portalRows = fsArr.map(f=>{
       const sp = spArr.find(s=>s.hub_cluster_uuid===f.uuid)||{};
       return { uuid:f.uuid, usedBytes:parseInt(f.usage_bytes||0),
                spokePath:sp.spoke_root_path||'—', hubAddr:sp.hub_address||'—',
+               hubPort:sp.hub_port||8000,
                status:sp.status||'—', state:sp.state||'—', spokeType:sp.spoke_type||'—',
                spokeEntryId: sp.id||'' };
     });
+
+    // Auto-register hubs discovered via portal relationships
+    if(S.canPortals){
+      const discoveredHubs = {};
+      spArr.forEach(e=>{
+        if(e.hub_address){
+          const port = e.hub_port||8000;
+          const host = port===8000 ? e.hub_address : e.hub_address+':'+port;
+          discoveredHubs[host] = host;
+        }
+      });
+      for(const [host] of Object.entries(discoveredHubs)){
+        const alreadyKnown = S.hubs.some(h=>h.host===host);
+        if(!alreadyKnown){
+          try{
+            const d = await api('/app/hubs','POST',{name:host, host:host},true);
+            S.hubs.push({id:d.id, name:d.name, host:d.host, has_token:false, token_expired:false});
+            log('Discovered hub: '+host+' (from spoke '+spoke.name+')','info');
+          }catch(e){
+            if(!e.message.includes('already exists')) log('Could not register hub '+host+': '+e.message,'warn');
+          }
+        }
+      }
+    }
+
     spoke.fetchError = null;
   }catch(e){
     spoke.fetchError = e.message;
@@ -987,6 +1047,7 @@ async function loadUsersTable(){
             +'<option value="monitor"'+(u.role==='monitor'?' selected':'')+'>monitor</option>'
             +'<option value="portal_manager"'+(u.role==='portal_manager'?' selected':'')+'>portal_manager</option>'
             +'</select>'
+            +'<button class="btn xs warn" onclick="doAdminChangePwOpen(\''+esc(u.username)+'\')"><span>PW</span></button>'
             +'<button class="btn xs danger" onclick="doDeleteUser(\''+esc(u.username)+'\')"><span>DEL</span></button>'
             +'</div>';
         return '<tr><td style="color:var(--text-bright);font-weight:700">'+esc(u.username)+'</td><td>'+roleBadge+'</td><td class="dim">'+fmtDate(u.created)+'</td><td>'+actions+'</td></tr>';
@@ -1027,10 +1088,76 @@ async function doDeleteUser(username){
   }catch(e){ log('Delete user error: '+e.message,'err'); }
 }
 
+// ══ CHANGE PASSWORD ═══════════════════════════════════════════════════
+// Called from top bar — change own password
+function doChangePwOpen(){
+  document.getElementById('change-pw-title').textContent   = 'CHANGE PASSWORD';
+  document.getElementById('change-pw-subtitle').textContent = 'Enter your current password and choose a new one.';
+  document.getElementById('change-pw-old-wrap').style.display = '';
+  document.getElementById('change-pw-old').value     = '';
+  document.getElementById('change-pw-new').value     = '';
+  document.getElementById('change-pw-confirm').value = '';
+  document.getElementById('change-pw-error').style.display = 'none';
+  document.getElementById('change-pw-submit').onclick = doChangePassword;
+  document.getElementById('modal-change-pw').classList.add('open');
+  document.getElementById('change-pw-old').focus();
+}
+
+// Called from admin users table — set password for another user
+function doAdminChangePwOpen(username){
+  document.getElementById('change-pw-title').textContent   = 'SET PASSWORD: ' + username.toUpperCase();
+  document.getElementById('change-pw-subtitle').textContent = 'Set a new password for ' + username + '. No current password required.';
+  document.getElementById('change-pw-old-wrap').style.display = 'none';
+  document.getElementById('change-pw-old').value     = '';
+  document.getElementById('change-pw-new').value     = '';
+  document.getElementById('change-pw-confirm').value = '';
+  document.getElementById('change-pw-error').style.display = 'none';
+  document.getElementById('change-pw-submit').onclick = () => doAdminChangePassword(username);
+  document.getElementById('modal-change-pw').classList.add('open');
+  document.getElementById('change-pw-new').focus();
+}
+
+async function doChangePassword(){
+  const oldPw  = document.getElementById('change-pw-old').value;
+  const newPw  = document.getElementById('change-pw-new').value;
+  const confirm= document.getElementById('change-pw-confirm').value;
+  const btn    = document.getElementById('change-pw-submit');
+  const err    = document.getElementById('change-pw-error');
+  err.style.display = 'none';
+  if(!oldPw||!newPw){ showErr(err,'All fields are required.'); return; }
+  if(newPw !== confirm){ showErr(err,'New passwords do not match.'); return; }
+  if(newPw.length < 6){ showErr(err,'Password must be at least 6 characters.'); return; }
+  btn.disabled=true; btn.querySelector('span').textContent='SAVING...';
+  try{
+    await api('/app/me/password','PATCH',{old_password:oldPw, new_password:newPw},true);
+    log('Password changed successfully','ok');
+    closeModal('modal-change-pw');
+  }catch(e){ showErr(err,e.message); }
+  finally{ btn.disabled=false; btn.querySelector('span').textContent='CHANGE PASSWORD'; }
+}
+
+async function doAdminChangePassword(username){
+  const newPw  = document.getElementById('change-pw-new').value;
+  const confirm= document.getElementById('change-pw-confirm').value;
+  const btn    = document.getElementById('change-pw-submit');
+  const err    = document.getElementById('change-pw-error');
+  err.style.display = 'none';
+  if(!newPw){ showErr(err,'New password is required.'); return; }
+  if(newPw !== confirm){ showErr(err,'Passwords do not match.'); return; }
+  if(newPw.length < 6){ showErr(err,'Password must be at least 6 characters.'); return; }
+  btn.disabled=true; btn.querySelector('span').textContent='SAVING...';
+  try{
+    await api('/app/users/'+encodeURIComponent(username),'PATCH',{password:newPw},true);
+    log('Password updated for '+username,'ok');
+    closeModal('modal-change-pw');
+  }catch(e){ showErr(err,e.message); }
+  finally{ btn.disabled=false; btn.querySelector('span').textContent='CHANGE PASSWORD'; }
+}
+
 // ══ KEYBOARD ═══════════════════════════════════════════════════════════
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){
-    ['modal-add-spoke','modal-add-hub','modal-auth','modal-create-portal','modal-users']
+    ['modal-add-spoke','modal-add-hub','modal-auth','modal-create-portal','modal-users','modal-change-pw']
       .forEach(id=>document.getElementById(id).classList.remove('open'));
   }
 });

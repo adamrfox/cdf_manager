@@ -49,6 +49,7 @@ try:
     QUMULO_TOKEN_EXPIRY_DAYS = config.QUMULO_TOKEN_EXPIRY_DAYS
     STATE_FILE               = config.STATE_FILE
     USERS_FILE               = config.USERS_FILE
+    SESSIONS_FILE            = getattr(config, 'SESSIONS_FILE', 'sessions.json')
     PORT                     = config.PROXY_PORT
 except ImportError:
     print("WARNING: config.py not found, using defaults")
@@ -58,6 +59,7 @@ except ImportError:
     QUMULO_TOKEN_EXPIRY_DAYS = 30
     STATE_FILE               = "state.json"
     USERS_FILE               = "users.json"
+    SESSIONS_FILE            = "sessions.json"
     PORT                     = 8081
 
 ROLES = ("monitor", "portal_manager")
@@ -68,7 +70,30 @@ SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
 
 # ── Sessions ───────────────────────────────────────────────────────────
-sessions = {}
+# ── Sessions ───────────────────────────────────────────────────
+def load_sessions():
+    if os.path.exists(SESSIONS_FILE):
+        try:
+            with open(SESSIONS_FILE) as f:
+                raw = json.load(f)
+            now   = datetime.now(timezone.utc)
+            valid = {k: v for k, v in raw.items()
+                     if datetime.fromisoformat(v["expires"]) > now}
+            if len(valid) < len(raw):
+                print(f"  Dropped {len(raw)-len(valid)} expired session(s) on load")
+            return valid
+        except Exception as e:
+            print(f"  WARNING: Could not load sessions: {e}")
+    return {}
+
+def save_sessions():
+    try:
+        with open(SESSIONS_FILE, "w") as f:
+            json.dump(sessions, f, indent=2)
+    except Exception as e:
+        print(f"  WARNING: Could not save sessions: {e}")
+
+sessions = load_sessions()
 
 # ── User store ─────────────────────────────────────────────────────────
 def load_users():
@@ -154,6 +179,7 @@ def create_session(username):
     token   = secrets.token_hex(32)
     expires = datetime.now(timezone.utc) + timedelta(seconds=APP_SESSION_EXPIRY)
     sessions[token] = {"username": username, "expires": expires.isoformat()}
+    save_sessions()
     return token, expires.isoformat()
 
 def validate_session(token):
@@ -162,6 +188,7 @@ def validate_session(token):
     s = sessions[token]
     if datetime.fromisoformat(s["expires"]) < datetime.now(timezone.utc):
         del sessions[token]
+        save_sessions()
         return None
     return s["username"]
 
@@ -414,6 +441,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             token = get_bearer(self.headers)
             if token and token in sessions:
                 del sessions[token]
+                save_sessions()
             self.send_json(200, {"ok": True})
             return
 
@@ -616,26 +644,80 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = self.read_json()
         print(f"\n[{self.client_address[0]}] PATCH {path}")
 
-        # Update user role (admin only)
+        # Change own password
+        if path == "/app/me/password":
+            username = self.require_session()
+            if not username: return
+            old_pw  = payload.get("old_password", "")
+            new_pw  = payload.get("new_password", "")
+            if not old_pw or not new_pw:
+                self.send_json(400, {"error": "old_password and new_password are required."})
+                return
+            if len(new_pw) < 6:
+                self.send_json(400, {"error": "Password must be at least 6 characters."})
+                return
+            if not check_password(username, old_pw):
+                self.send_json(401, {"error": "Current password is incorrect."})
+                return
+            # Admin password lives in config.py — cannot be changed via API
+            if username == ADMIN_USERNAME:
+                self.send_json(400, {"error": "Admin password must be changed in config.py."})
+                return
+            users = load_users()
+            if username not in users:
+                self.send_json(404, {"error": "User not found."})
+                return
+            users[username]["password_hash"] = hashlib.sha256(new_pw.encode()).hexdigest()
+            save_users(users)
+            print(f"  Password changed: {username}")
+            self.send_json(200, {"ok": True})
+            return
+
+        # Update user role or password (admin only)
         if path.startswith("/app/users/"):
             admin = self.require_admin()
             if not admin: return
-            target = path.split("/")[3]
-            if target == ADMIN_USERNAME:
-                self.send_json(400, {"error": "Cannot change the built-in admin's role."})
-                return
+            target  = path.split("/")[3]
             new_role = payload.get("role", "")
-            if new_role not in ROLES:
-                self.send_json(400, {"error": f"role must be one of: {', '.join(ROLES)}"})
+            new_pw   = payload.get("password", "")
+
+            # Role change
+            if new_role:
+                if target == ADMIN_USERNAME:
+                    self.send_json(400, {"error": "Cannot change the built-in admin's role."})
+                    return
+                if new_role not in ROLES:
+                    self.send_json(400, {"error": f"role must be one of: {', '.join(ROLES)}"})
+                    return
+                users = load_users()
+                if target not in users:
+                    self.send_json(404, {"error": f"User '{target}' not found."})
+                    return
+                users[target]["role"] = new_role
+                save_users(users)
+                print(f"  Updated {target} role -> {new_role} (by {admin})")
+                self.send_json(200, {"ok": True, "username": target, "role": new_role})
                 return
-            users = load_users()
-            if target not in users:
-                self.send_json(404, {"error": f"User '{target}' not found."})
+
+            # Password change by admin
+            if new_pw:
+                if len(new_pw) < 6:
+                    self.send_json(400, {"error": "Password must be at least 6 characters."})
+                    return
+                if target == ADMIN_USERNAME:
+                    self.send_json(400, {"error": "Admin password must be changed in config.py."})
+                    return
+                users = load_users()
+                if target not in users:
+                    self.send_json(404, {"error": f"User '{target}' not found."})
+                    return
+                users[target]["password_hash"] = hashlib.sha256(new_pw.encode()).hexdigest()
+                save_users(users)
+                print(f"  Password changed for {target} (by {admin})")
+                self.send_json(200, {"ok": True})
                 return
-            users[target]["role"] = new_role
-            save_users(users)
-            print(f"  Updated {target} role -> {new_role} (by {admin})")
-            self.send_json(200, {"ok": True, "username": target, "role": new_role})
+
+            self.send_json(400, {"error": "Provide role or password to update."})
             return
 
         self.send_json(404, {"error": "Not found"})
