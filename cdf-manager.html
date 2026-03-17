@@ -678,11 +678,12 @@ function updateCountdown(){
   if(fill) fill.style.width=(S.countdown/S.refreshInterval*100)+'%';
 }
 async function doRefresh(){
-  // Fetch spokes first — this may auto-register new hubs discovered via portal data.
-  // Then re-fetch hubs from server so newly registered ones appear with correct state.
+  // Reset countdown so the bar reflects the fresh cycle
+  S.countdown = S.refreshInterval||30;
+  updateCountdown();
   await fetchSpokes();
   if(S.canPortals){
-    await fetchHubs();     // picks up any hubs auto-registered during fetchSpokes
+    await fetchHubs();
     renderHubsPanel();
   }
   if(S.activeTab==='portals') renderPortalsTab();
@@ -793,7 +794,7 @@ function renderSpokeCard(spoke){
     +'<div class="cluster-card-stripe" style="background:'+col+'"></div>'
     +'<div class="cluster-card-header">'
     +'<div><div class="cluster-card-name">'+esc(spoke.name)+'</div><div class="cluster-card-host">'+esc(spoke.host)+'</div></div>'
-    +'<span class="status-badge '+cls+'">'+( p>85?'CRITICAL':p>65?'WARN':'HEALTHY')+'</span>'
+    +'<span class="status-badge '+cls+'">'+(p>85?'CRITICAL':p>65?'WARN':((spoke.portalRows&&spoke.portalRows.length)?'HEALTHY':'EMPTY'))+'</span>'
     +'</div>'
     +'<div class="cluster-card-body">'
     +'<div style="display:flex;justify-content:space-between;align-items:baseline">'
@@ -836,7 +837,15 @@ async function fetchHubData(hub){
     hub.totalFree = parseInt(fs.free_size_bytes||0);
     hub.totalUsed = hub.totalCap - hub.totalFree;
     hub.fetchError = null;
-  }catch(e){ hub.fetchError = e.message; }
+  }catch(e){ hub.fetchError = e.message; return; }
+  // Fetch connected spokes via /v2/portal/hubs/ — non-fatal if it fails
+  try{
+    const ph = await proxyCall(hub.host,'/v2/portal/hubs/','GET','',hub.id);
+    console.log('hub portal hubs response:', JSON.stringify(ph).substring(0,200));
+    const entries = Array.isArray(ph)?ph:(Array.isArray(ph.entries)?ph.entries:[]);
+    hub.portalEntries = entries;
+    hub.spokeCount    = entries.length;
+  }catch(e){ console.error('hub portal fetch error:',e); hub.spokeCount=0; hub.portalEntries=[]; }
 }
 
 function renderHubsPanel(){
@@ -860,7 +869,7 @@ function renderHubCard(hub){
     +'<div class="cluster-card-stripe" style="background:var(--purple)"></div>'
     +'<div class="cluster-card-header">'
     +'<div><div class="cluster-card-name">'+esc(hub.name)+'</div><div class="cluster-card-host">'+esc(hub.host)+'</div></div>'
-    +'<span class="status-badge" style="color:var(--purple);border-color:var(--purple)">HUB</span>'
+    +'<span class="status-badge" style="color:var(--purple);border-color:var(--purple)">'+(hub.spokeCount>0?'HUB':'EMPTY')+'</span>'
     +'</div>'
     +'<div class="cluster-card-body">'
     +'<div style="display:flex;justify-content:space-between;align-items:baseline">'
@@ -872,6 +881,18 @@ function renderHubCard(hub){
     +'<span style="font-family:var(--mono);font-size:12px;color:'+col+'">'+fmt(used)+' ('+p.toFixed(1)+'%)</span>'
     +'</div>'
     +'<div class="usage-bar-track"><div class="usage-bar-fill" style="width:'+p.toFixed(1)+'%;background:'+col+'"></div></div>'
+    +(hub.portalEntries&&hub.portalEntries.length?
+        '<div style="border-top:1px solid var(--border);padding-top:10px;margin-top:4px">'
+        +'<div style="font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:1px;margin-bottom:8px">CONNECTED SPOKES</div>'
+        +hub.portalEntries.map(function(e){
+          const stCol = e.status==='ACTIVE'?'var(--ok)':e.status==='INACTIVE'?'var(--warn)':'var(--text-dim)';
+          return '<div style="display:flex;justify-content:space-between;margin-bottom:5px">'
+            +'<span style="font-family:var(--cond);font-size:13px;font-weight:700;color:var(--text-bright)">'+esc(e.spoke_cluster_name||e.spoke_cluster_uuid||'—')+'</span>'
+            +'<span style="font-family:var(--mono);font-size:11px;color:'+stCol+'">'+esc(e.state)+' / '+esc(e.status)+'</span>'
+            +'</div>';
+        }).join('')
+        +'</div>'
+      :'')
     +'<div class="meta-row"><div>TOKEN EXP <span>'+fmtDate(hub.token_expires)+'</span></div></div>'
     +'</div>'
     +'<div class="cluster-card-actions">'
