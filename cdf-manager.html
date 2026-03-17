@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CDF Manager</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiIgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIj4KICA8cmVjdCB4PSIxMiIgeT0iMCIgIHdpZHRoPSIxOCIgaGVpZ2h0PSIxOCIgcng9IjQiIGZpbGw9IiMzOGI4ZjAiLz4KICA8cmVjdCB4PSIwIiAgeT0iMTIiIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgcng9IjUiIGZpbGw9IiMyYTdmYzQiLz4KICA8cmVjdCB4PSIxMiIgeT0iMTIiIHdpZHRoPSI4IiAgaGVpZ2h0PSI2IiAgcng9IjIiIGZpbGw9IiMxYTVhOTAiIG9wYWNpdHk9IjAuOSIvPgo8L3N2Zz4=">
+<link rel="shortcut icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiIgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIj4KICA8cmVjdCB4PSIxMiIgeT0iMCIgIHdpZHRoPSIxOCIgaGVpZ2h0PSIxOCIgcng9IjQiIGZpbGw9IiMzOGI4ZjAiLz4KICA8cmVjdCB4PSIwIiAgeT0iMTIiIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgcng9IjUiIGZpbGw9IiMyYTdmYzQiLz4KICA8cmVjdCB4PSIxMiIgeT0iMTIiIHdpZHRoPSI4IiAgaGVpZ2h0PSI2IiAgcng9IjIiIGZpbGw9IiMxYTVhOTAiIG9wYWNpdHk9IjAuOSIvPgo8L3N2Zz4=">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600;700&family=Barlow+Condensed:wght@600;700&display=swap');
 
@@ -915,7 +917,7 @@ async function renderPortalsTab(){
   for(const spoke of S.spokes){
     if(!spoke.portalRows) continue;
     for(const r of spoke.portalRows){
-      rows.push({...r, spokeName:spoke.name, spokeHost:spoke.host, spokeId:spoke.id});
+      rows.push({...r, spokeName:spoke.name, spokeHost:spoke.host, spokeId:spoke.id, totalCap:spoke.totalCap||0});
     }
   }
 
@@ -931,7 +933,7 @@ async function renderPortalsTab(){
   html += '<div style="overflow-x:auto"><table class="portal-table">'
     +'<thead><tr>'
     +'<th>SPOKE CLUSTER</th><th>SPOKE PATH</th><th>HUB ADDRESS</th>'
-    +'<th>TYPE</th><th>STATE</th><th>STATUS</th><th>USED</th>'
+    +'<th>TYPE</th><th>STATE</th><th>STATUS</th><th>CAPACITY USED</th>'
     +(canCreate?'<th></th>':'')
     +'</tr></thead><tbody>'
     +rows.map(r=>{
@@ -946,7 +948,20 @@ async function renderPortalsTab(){
         +'<td class="dim">'+esc(r.spokeType)+'</td>'
         +'<td class="dim">'+esc(r.state)+'</td>'
         +'<td><span style="color:'+stCol+'">'+esc(r.status)+'</span></td>'
-        +'<td>'+fmt(r.usedBytes)+'</td>'
+        +(function(){
+          const p = r.totalCap ? Math.min(100, r.usedBytes/r.totalCap*100) : 0;
+          const col = p>85?'var(--danger)':p>65?'var(--warn)':'var(--ok)';
+          return '<td style="min-width:160px">'
+            +'<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px">'
+            +'<span style="font-family:var(--mono);font-size:12px;color:'+col+'">'+fmt(r.usedBytes)+'</span>'
+            +'<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">/ '+fmt(r.totalCap)+'</span>'
+            +'<span style="font-family:var(--mono);font-size:11px;color:'+col+';margin-left:6px">'+p.toFixed(1)+'%</span>'
+            +'</div>'
+            +'<div style="height:4px;background:var(--border)">'
+            +'<div style="height:100%;width:'+p.toFixed(1)+'%;background:'+col+';transition:width 0.5s"></div>'
+            +'</div>'
+            +'</td>';
+        })()
         +(canCreate?'<td>'+delBtn+'</td>':'')
         +'</tr>';
     }).join('')
