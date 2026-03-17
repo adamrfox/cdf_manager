@@ -50,6 +50,7 @@ try:
     STATE_FILE               = config.STATE_FILE
     USERS_FILE               = config.USERS_FILE
     SESSIONS_FILE            = getattr(config, 'SESSIONS_FILE', 'sessions.json')
+    SETTINGS_FILE            = getattr(config, 'SETTINGS_FILE', 'settings.json')
     PORT                     = config.PROXY_PORT
 except ImportError:
     print("WARNING: config.py not found, using defaults")
@@ -60,9 +61,13 @@ except ImportError:
     STATE_FILE               = "state.json"
     USERS_FILE               = "users.json"
     SESSIONS_FILE            = "sessions.json"
+    SETTINGS_FILE            = "settings.json"
     PORT                     = 8081
 
 ROLES = ("monitor", "portal_manager")
+
+# Mutable dict — lets password changes take effect in-process without globals
+_admin = {"password_hash": ADMIN_PASSWORD_HASH}
 
 # ── SSL context ────────────────────────────────────────────────────────
 SSL_CTX = ssl.create_default_context()
@@ -95,6 +100,31 @@ def save_sessions():
 
 sessions = load_sessions()
 
+# ── Settings persistence ───────────────────────────────────────────────
+DEFAULT_SETTINGS = {
+    "refresh_interval_seconds": 30,
+}
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE) as f:
+                data = json.load(f)
+            # Merge with defaults so new keys are always present
+            return {**DEFAULT_SETTINGS, **data}
+        except Exception as e:
+            print(f"  WARNING: Could not load settings: {e}")
+    return dict(DEFAULT_SETTINGS)
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"  WARNING: Could not save settings: {e}")
+
+app_settings = load_settings()
+
 # ── User store ─────────────────────────────────────────────────────────
 def load_users():
     if os.path.exists(USERS_FILE):
@@ -116,7 +146,7 @@ def save_users(users):
 def get_all_users():
     users = load_users()
     users[ADMIN_USERNAME] = {
-        "password_hash": ADMIN_PASSWORD_HASH,
+        "password_hash": _admin["password_hash"],
         "role":          "admin",
         "created":       "built-in",
     }
@@ -165,6 +195,53 @@ def save_state(state):
         print(f"  WARNING: Could not save state: {e}")
 
 app_state = load_state()
+
+def normalize_hub_host(host):
+    """Strip non-API ports from hub host. Qumulo API is always on port 8000.
+    hub_port in portal data is the replication port, not the API port."""
+    if ':' in host:
+        addr, port = host.rsplit(':', 1)
+        if port == '8000':
+            return addr  # 8000 is default, no need to specify
+        # Any other port is likely the replication port — drop it
+        return addr
+    return host
+
+def dedup_hubs():
+    """Normalize hub hosts and remove duplicates on startup."""
+    changed = False
+    for username, udata in app_state.items():
+        hubs = udata.get("hubs", {})
+        # First pass: normalize all hosts (strip replication ports)
+        for hid, hub in hubs.items():
+            normalized = normalize_hub_host(hub.get("host", ""))
+            if normalized != hub.get("host", ""):
+                print(f"  Normalize hub {hid}: {hub['host']} -> {normalized} for {username}")
+                hub["host"] = normalized
+                hub["name"] = normalized  # update name too if it was the host
+                changed = True
+        # Second pass: remove duplicates by normalized host
+        seen_hosts = {}
+        to_delete = []
+        for hid, hub in hubs.items():
+            host = hub.get("host", "")
+            if host in seen_hosts:
+                existing_id = seen_hosts[host]
+                if hub.get("token") and not hubs[existing_id].get("token"):
+                    to_delete.append(existing_id)
+                    seen_hosts[host] = hid
+                else:
+                    to_delete.append(hid)
+            else:
+                seen_hosts[host] = hid
+        for hid in to_delete:
+            print(f"  Dedup: removed duplicate hub {hid} ({hubs[hid].get('host')}) for {username}")
+            del hubs[hid]
+            changed = True
+    if changed:
+        save_state(app_state)
+
+dedup_hubs()
 
 def get_user_state(username):
     if username not in app_state:
@@ -272,6 +349,25 @@ def get_cluster_token(username, cluster_type, cluster_id):
         return None, f"{cluster_type.capitalize()} token expired — re-authenticate"
     return token, None
 
+# ── Admin password update ─────────────────────────────────────────────
+def update_admin_password_in_config(new_hash):
+    """Rewrite ADMIN_PASSWORD_HASH in config.py with the new hash."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
+    if not os.path.exists(config_path):
+        raise RuntimeError("config.py not found — cannot persist admin password change.")
+    with open(config_path, "r") as f:
+        lines = f.readlines()
+    updated = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith("ADMIN_PASSWORD_HASH"):
+            lines[i] = f'ADMIN_PASSWORD_HASH   = "{new_hash}"\n'
+            updated = True
+            break
+    if not updated:
+        raise RuntimeError("ADMIN_PASSWORD_HASH not found in config.py.")
+    with open(config_path, "w") as f:
+        f.writelines(lines)
+
 # ── HTTP Handler ───────────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
 
@@ -304,6 +400,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         token    = get_bearer(self.headers)
         username = validate_session(token)
         if not username:
+            print(f"  require_session: FAILED token={repr(token[:12]) if token else None} sessions={list(sessions.keys())[:3]}")
             self.send_json(401, {"error": "Invalid or expired session. Please log in again."})
         return username
 
@@ -316,9 +413,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def require_portal_manager(self):
         username = self.require_session()
-        if username and not can_manage_portals(username):
-            self.send_json(403, {"error": "Portal Manager role required."})
-            return None
+        if username:
+            role = get_role(username)
+            can = can_manage_portals(username)
+            print(f"  require_portal_manager: user={repr(username)} role={role} can={can}")
+            if not can:
+                self.send_json(403, {"error": "Portal Manager role required."})
+                return None
         return username
 
     def auth_cluster(self, username, host, qu_user, qu_pass):
@@ -406,6 +507,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "built_in": uname == ADMIN_USERNAME,
                 })
             self.send_json(200, {"users": result})
+            return
+
+        # Get settings (admin only)
+        if path == "/app/settings":
+            username = self.require_admin()
+            if not username: return
+            self.send_json(200, app_settings)
             return
 
         self.send_json(404, {"error": "Not found"})
@@ -513,21 +621,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(401, {"error": err})
                 return
             spoke["token"] = token; spoke["token_expires"] = expires
+            # Try to fetch the cluster name
+            try:
+                sn, node_info = qumulo_request(spoke["host"], "/v1/cluster/settings", "GET", token, None)
+                if sn < 400:
+                    cluster_name = node_info.get("cluster_name") or node_info.get("name")
+                    if cluster_name and (spoke["name"] == spoke["host"] or not spoke["name"]):
+                        spoke["name"] = cluster_name
+                        print(f"  Spoke name: {cluster_name}")
+                if sn >= 400 or spoke["name"] == spoke["host"]:
+                    sn2, cluster_info = qumulo_request(spoke["host"], "/v1/cluster/", "GET", token, None)
+                    if sn2 < 400:
+                        cluster_name = cluster_info.get("cluster_name") or cluster_info.get("name")
+                        if cluster_name and (spoke["name"] == spoke["host"] or not spoke["name"]):
+                            spoke["name"] = cluster_name
+                            print(f"  Spoke name (from /v1/cluster/): {cluster_name}")
+            except Exception as e:
+                print(f"  Could not fetch spoke name: {e}")
             save_state(app_state)
             print(f"  Spoke {sid} authenticated, expires {expires}")
-            self.send_json(200, {"ok": True, "token_expires": expires})
+            self.send_json(200, {"ok": True, "token_expires": expires, "name": spoke.get("name", spoke["host"])})
             return
 
         # Add a hub
         if path == "/app/hubs":
             username = self.require_portal_manager()
             if not username: return
-            host = payload.get("host", "").strip()
-            name = payload.get("name", "").strip() or host
+            host = normalize_hub_host(payload.get("host", "").strip())
+            name = payload.get("name", "").strip()
+            name = normalize_hub_host(name) if name else host
             if not host:
                 self.send_json(400, {"error": "host is required"})
                 return
             user = get_user_state(username)
+            # Deduplicate — return existing entry if this host is already registered
+            for hid, existing in user["hubs"].items():
+                if existing.get("host") == host:
+                    print(f"  Hub already exists: {host} for {username}")
+                    self.send_json(200, {"id": hid, "name": existing["name"], "host": host})
+                    return
             hid  = str(uuid.uuid4())[:8]
             user["hubs"][hid] = {
                 "id": hid, "name": name, "host": host,
@@ -556,9 +688,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(401, {"error": err})
                 return
             hub["token"] = token; hub["token_expires"] = expires
+            # Try to fetch the cluster name from the hub
+            try:
+                sn, node_info = qumulo_request(hub["host"], "/v1/cluster/settings", "GET", token, None)
+                if sn < 400:
+                    cluster_name = node_info.get("cluster_name") or node_info.get("name")
+                    if cluster_name:
+                        hub["name"] = cluster_name
+                        print(f"  Hub name: {cluster_name}")
+                # Also try /v1/cluster/ if settings didn't have a name
+                if sn >= 400 or not hub.get("name") or hub["name"] == hub["host"]:
+                    sn2, cluster_info = qumulo_request(hub["host"], "/v1/cluster/", "GET", token, None)
+                    if sn2 < 400:
+                        cluster_name = cluster_info.get("cluster_name") or cluster_info.get("name")
+                        if cluster_name:
+                            hub["name"] = cluster_name
+                            print(f"  Hub name (from /v1/cluster/): {cluster_name}")
+            except Exception as e:
+                print(f"  Could not fetch hub name: {e}")
             save_state(app_state)
             print(f"  Hub {hid} authenticated, expires {expires}")
-            self.send_json(200, {"ok": True, "token_expires": expires})
+            self.send_json(200, {"ok": True, "token_expires": expires, "name": hub.get("name", hub["host"])})
             return
 
         # Create a portal relationship
@@ -566,13 +716,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             username = self.require_portal_manager()
             if not username: return
 
-            spoke_id    = payload.get("spoke_id", "")
-            hub_id      = payload.get("hub_id", "")
-            spoke_root  = payload.get("spoke_root", "")
-            hub_root    = payload.get("hub_root", "")
+            spoke_id             = payload.get("spoke_id", "")
+            hub_id               = payload.get("hub_id", "")
+            spoke_root           = payload.get("spoke_root", "")
+            hub_root             = payload.get("hub_root", "")
+            portal_type          = payload.get("portal_type", "PORTAL_READ_WRITE")
+            hub_replication_port = int(payload.get("hub_replication_port", 3713))
+            spoke_replication_port = int(payload.get("spoke_replication_port", 3713))
 
             if not all([spoke_id, hub_id, spoke_root, hub_root]):
-                self.send_json(400, {"error": "spoke_id, hub_id, spoke_root, and hub_root are required"})
+                self.send_json(400, {"error": "spoke_id, hub_id, spoke_root, and hub_root are required."})
                 return
 
             user = get_user_state(username)
@@ -586,27 +739,91 @@ class Handler(http.server.BaseHTTPRequestHandler):
             hub_token, err = get_cluster_token(username, "hub", hub_id)
             if err: self.send_json(401, {"error": f"Hub: {err}"}); return
 
-            # Step 1: get hub cluster info to obtain hub_id UUID
-            s1, hub_info = qumulo_request(hub["host"], "/v1/cluster/settings", "GET", hub_token, None)
+            hub_addr   = hub["host"].split(":")[0]
+            spoke_addr = spoke["host"].split(":")[0]
+
+            # ── Step 1: Create spoke entry on the spoke cluster ───────────
+            print(f"  Portal step 1: create spoke on {spoke['host']}")
+            s1, spoke_entry = qumulo_request(
+                spoke["host"], "/v2/portal/spokes/", "POST", spoke_token,
+                {"type": portal_type, "hub_hosts": [{"address": hub_addr, "port": hub_replication_port}]}
+            )
             if s1 >= 400:
-                self.send_json(s1, {"error": "Could not fetch hub cluster info", "detail": hub_info})
+                self.send_json(s1, {"error": f"Step 1 failed: could not create spoke entry", "detail": spoke_entry})
                 return
-            hub_cluster_id = hub_info.get("cluster_id") or hub_info.get("guid") or hub_info.get("id")
+            spoke_entry_id = spoke_entry.get("id")
+            print(f"  Portal step 1 OK: spoke entry id={spoke_entry_id}")
 
-            # Step 2: create the spoke relationship on the spoke cluster
-            spoke_body = {
-                "spoke_root":       spoke_root,
-                "hub_address":      hub["host"].split(":")[0],
-                "hub_port":         int(hub["host"].split(":")[1]) if ":" in hub["host"] else 8000,
-                "hub_root":         hub_root,
-            }
-            s2, result = qumulo_request(spoke["host"], "/v2/portal/spokes/", "POST", spoke_token, spoke_body)
+            # ── Step 2: Set root paths on the spoke cluster ───────────────
+            print(f"  Portal step 2: set roots spoke={spoke_root} hub={hub_root}")
+            s2, roots_result = qumulo_request(
+                spoke["host"], f"/v2/portal/spokes/{spoke_entry_id}/roots/", "POST", spoke_token,
+                {"spoke_root_path": spoke_root, "hub_root_path": hub_root}
+            )
             if s2 >= 400:
-                self.send_json(s2, {"error": "Failed to create portal relationship", "detail": result})
+                self.send_json(s2, {"error": f"Step 2 failed: could not set root paths", "detail": roots_result})
                 return
+            print(f"  Portal step 2 OK: roots set")
 
-            print(f"  Portal created: spoke {spoke_id} -> hub {hub_id}")
-            self.send_json(200, {"ok": True, "portal": result})
+            # ── Step 3: Find the pending hub entry on the hub cluster ─────
+            print(f"  Portal step 3: find pending hub entry on {hub['host']}")
+            s3, hubs_list = qumulo_request(hub["host"], "/v2/portal/hubs/", "GET", hub_token, None)
+            if s3 >= 400:
+                self.send_json(s3, {"error": f"Step 3 failed: could not list hub entries", "detail": hubs_list})
+                return
+            # Match by spoke_cluster_uuid from the spoke entry response
+            spoke_cluster_uuid = spoke_entry.get("hub_cluster_uuid") or ""
+            hub_entries = hubs_list.get("entries", [])
+            # Find the pending entry — match by state=PENDING and spoke cluster uuid if available
+            hub_entry = None
+            for entry in hub_entries:
+                if entry.get("state") == "PENDING":
+                    # If we have the spoke's cluster UUID, use it to match
+                    # Otherwise just take the first PENDING entry
+                    hub_entry = entry
+                    break
+            if not hub_entry:
+                self.send_json(500, {"error": "Step 3 failed: no pending hub entry found after spoke creation", "hub_entries": hub_entries})
+                return
+            hub_entry_id     = hub_entry.get("id")
+            pending_roots    = hub_entry.get("pending_roots", [])
+            print(f"  Portal step 3 OK: hub entry id={hub_entry_id} pending_roots={pending_roots}")
+
+            # ── Step 4: Accept the spoke on the hub cluster ───────────────
+            print(f"  Portal step 4: accept spoke on hub")
+            s4, accept_result = qumulo_request(
+                hub["host"], f"/v2/portal/hubs/{hub_entry_id}/accept", "POST", hub_token,
+                {"spoke_hosts": [{"address": spoke_addr, "port": spoke_replication_port}],
+                 "authorized_roots": pending_roots}
+            )
+            if s4 >= 400:
+                self.send_json(s4, {"error": f"Step 4 failed: could not accept spoke on hub", "detail": accept_result})
+                return
+            print(f"  Portal step 4 OK: spoke accepted, state={accept_result.get('state')}")
+
+            # ── Step 5: Authorize any pending roots ───────────────────────
+            remaining_roots = accept_result.get("pending_roots", [])
+            if remaining_roots:
+                print(f"  Portal step 5: authorizing {len(remaining_roots)} pending root(s)")
+                final_result = accept_result
+                for root_id in remaining_roots:
+                    print(f"  Portal step 5: authorizing root {root_id}")
+                    s5, root_result = qumulo_request(
+                        hub["host"],
+                        f"/v2/portal/hubs/{hub_entry_id}/roots/{root_id}",
+                        "POST", hub_token, None
+                    )
+                    if s5 >= 400:
+                        self.send_json(s5, {"error": f"Step 5 failed: could not authorize root {root_id}", "detail": root_result})
+                        return
+                    final_result = root_result
+                    print(f"  Portal step 5 OK: root {root_id} authorized, status={root_result.get('status')}")
+            else:
+                final_result = accept_result
+                print(f"  Portal step 5: no pending roots to authorize")
+
+            print(f"  Portal created: spoke {spoke_id} ({spoke_addr}) -> hub {hub_id} ({hub_addr}), status={final_result.get('status')}")
+            self.send_json(200, {"ok": True, "spoke_entry": spoke_entry, "hub_entry": final_result})
             return
 
         # Proxy a Qumulo API call
@@ -644,6 +861,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = self.read_json()
         print(f"\n[{self.client_address[0]}] PATCH {path}")
 
+        # Update settings (admin only)
+        if path == "/app/settings":
+            admin = self.require_admin()
+            if not admin: return
+            allowed = set(DEFAULT_SETTINGS.keys())
+            updates = {k: v for k, v in payload.items() if k in allowed}
+            if not updates:
+                self.send_json(400, {"error": f"Valid settings keys: {', '.join(allowed)}"})
+                return
+            if "refresh_interval_seconds" in updates:
+                val = updates["refresh_interval_seconds"]
+                if not isinstance(val, int) or val < 5 or val > 3600:
+                    self.send_json(400, {"error": "refresh_interval_seconds must be between 5 and 3600"})
+                    return
+            app_settings.update(updates)
+            save_settings(app_settings)
+            print(f"  Settings updated by {admin}: {updates}")
+            self.send_json(200, app_settings)
+            return
+
         # Change own password
         if path == "/app/me/password":
             username = self.require_session()
@@ -659,9 +896,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not check_password(username, old_pw):
                 self.send_json(401, {"error": "Current password is incorrect."})
                 return
-            # Admin password lives in config.py — cannot be changed via API
+            # Admin password is stored in config.py — rewrite it there
             if username == ADMIN_USERNAME:
-                self.send_json(400, {"error": "Admin password must be changed in config.py."})
+                try:
+                    new_hash = hashlib.sha256(new_pw.encode()).hexdigest()
+                    update_admin_password_in_config(new_hash)
+                    # Update the module-level variable so running process reflects change
+                    _admin["password_hash"] = new_hash
+                    print(f"  Admin password updated in config.py")
+                    self.send_json(200, {"ok": True})
+                except Exception as e:
+                    self.send_json(500, {"error": f"Could not update config.py: {e}"})
                 return
             users = load_users()
             if username not in users:
@@ -705,7 +950,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json(400, {"error": "Password must be at least 6 characters."})
                     return
                 if target == ADMIN_USERNAME:
-                    self.send_json(400, {"error": "Admin password must be changed in config.py."})
+                    try:
+                        new_hash = hashlib.sha256(new_pw.encode()).hexdigest()
+                        update_admin_password_in_config(new_hash)
+                        _admin["password_hash"] = new_hash
+                        print(f"  Admin password updated in config.py (by {admin})")
+                        self.send_json(200, {"ok": True})
+                    except Exception as e:
+                        self.send_json(500, {"error": f"Could not update config.py: {e}"})
                     return
                 users = load_users()
                 if target not in users:

@@ -300,6 +300,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
       <span class="role-badge" id="topbar-role">—</span>
       <button class="btn sm" onclick="doChangePwOpen()"><span>🔑 PASSWORD</span></button>
       <button class="btn sm purple" id="btn-manage-users" onclick="doUsersOpen()" style="display:none"><span>⚙ USERS</span></button>
+      <button class="btn sm" id="btn-settings" onclick="doSettingsOpen()" style="display:none"><span>⚙ SETTINGS</span></button>
       <button class="btn sm danger" onclick="doAppLogout()"><span>SIGN OUT</span></button>
     </div>
   </div>
@@ -382,22 +383,62 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
 <div class="modal-overlay" id="modal-create-portal">
   <div class="modal" style="width:480px">
     <div class="modal-title">CREATE PORTAL RELATIONSHIP</div>
-    <div class="modal-subtitle">Select the spoke cluster and hub cluster, then specify the root paths on each side.</div>
-    <div class="field">
-      <label>SPOKE CLUSTER</label>
-      <select id="portal-spoke-select"></select>
+    <div class="modal-subtitle">The app will create the spoke entry, set root paths, then automatically approve on the hub.</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="field" style="margin:0">
+        <label>SPOKE CLUSTER</label>
+        <select id="portal-spoke-select"></select>
+      </div>
+      <div class="field" style="margin:0">
+        <label>HUB CLUSTER</label>
+        <div id="portal-hub-select-wrap">
+          <select id="portal-hub-select"></select>
+        </div>
+        <div id="portal-hub-add-wrap" style="display:none">
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input type="text" id="portal-hub-add-name" placeholder="Name (optional)" style="flex:1"/>
+            <input type="text" id="portal-hub-add-host" placeholder="10.x.x.x" style="flex:1"/>
+          </div>
+          <div style="display:flex;gap:6px">
+            <input type="password" id="portal-hub-add-pass" placeholder="Qumulo password"/>
+            <button class="btn sm" onclick="doPortalAddHub()" style="flex-shrink:0"><span>ADD &amp; AUTH</span></button>
+          </div>
+          <div id="portal-hub-add-error" style="font-family:var(--mono);font-size:11px;color:var(--danger);margin-top:6px;display:none"></div>
+        </div>
+        <div style="margin-top:5px">
+          <span id="portal-hub-toggle" onclick="togglePortalHubInput()"
+            style="font-family:var(--mono);font-size:10px;color:var(--accent);cursor:pointer;letter-spacing:1px">
+            + ADD NEW HUB
+          </span>
+        </div>
+      </div>
     </div>
-    <div class="field">
-      <label>SPOKE ROOT PATH</label>
-      <input type="text" id="portal-spoke-root" placeholder="/spoke-data"/>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px">
+      <div class="field" style="margin:0">
+        <label>SPOKE ROOT PATH</label>
+        <input type="text" id="portal-spoke-root" placeholder="/Videos"/>
+      </div>
+      <div class="field" style="margin:0">
+        <label>HUB ROOT PATH</label>
+        <input type="text" id="portal-hub-root" placeholder="/Videos"/>
+      </div>
     </div>
-    <div class="field">
-      <label>HUB CLUSTER</label>
-      <select id="portal-hub-select"></select>
-    </div>
-    <div class="field">
-      <label>HUB ROOT PATH</label>
-      <input type="text" id="portal-hub-root" placeholder="/hub-data"/>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:14px">
+      <div class="field" style="margin:0">
+        <label>PORTAL TYPE</label>
+        <select id="portal-type">
+          <option value="PORTAL_READ_WRITE">Read/Write</option>
+          <option value="PORTAL_READ_ONLY">Read Only</option>
+        </select>
+      </div>
+      <div class="field" style="margin:0">
+        <label>HUB REP PORT</label>
+        <input type="number" id="portal-hub-rep-port" value="3713"/>
+      </div>
+      <div class="field" style="margin:0">
+        <label>SPOKE REP PORT</label>
+        <input type="number" id="portal-spoke-rep-port" value="3713"/>
+      </div>
     </div>
     <div class="error-msg" id="portal-error"></div>
     <div class="modal-actions">
@@ -430,6 +471,26 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
     </div>
     <div class="error-msg" id="users-error"></div>
     <div class="modal-actions"><button class="btn sm danger" onclick="closeModal('modal-users')"><span>CLOSE</span></button></div>
+  </div>
+</div>
+
+<!-- Settings Modal -->
+<div class="modal-overlay" id="modal-settings">
+  <div class="modal" style="width:480px">
+    <div class="modal-title">SETTINGS</div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:2px;margin-bottom:16px">SPOKE MONITOR</div>
+    <div class="field">
+      <label>REFRESH INTERVAL (SECONDS)</label>
+      <div style="display:flex;align-items:center;gap:12px">
+        <input type="number" id="settings-refresh" min="5" max="3600" style="width:120px"/>
+        <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">min 5 · max 3600</span>
+      </div>
+    </div>
+    <div class="error-msg" id="settings-error"></div>
+    <div class="modal-actions">
+      <button class="btn sm danger" onclick="closeModal('modal-settings')"><span>CANCEL</span></button>
+      <button class="btn sm" id="settings-submit" onclick="doSaveSettings()"><span>SAVE SETTINGS</span></button>
+    </div>
   </div>
 </div>
 
@@ -473,6 +534,7 @@ let S = {
   hubs:            [],
   activeTab:       'spokes',
   countdown:       30,
+  refreshInterval: 30,
   countdownInt:    null,
   // pending auth context
   authType:        null,   // 'spoke' | 'hub'
@@ -516,7 +578,9 @@ async function api(path, method, body, auth=true){
   catch(e){ throw new Error('Cannot reach proxy at '+PROXY+' — is proxy.py running?'); }
   const data = await res.json().catch(()=>({}));
   // Only treat 401 as session expiry on authenticated calls — not on login itself
-  if(res.status===401 && auth && path !== '/app/login'){
+  // Only treat 401 as session expiry for app-level calls, not cluster auth endpoints
+  const isClusterAuth = path.includes('/auth') || path === '/app/me/password';
+  if(res.status===401 && auth && path !== '/app/login' && !isClusterAuth){
     log('Session expired','warn'); doForceLogout(); throw new Error('Session expired');
   }
   if(!res.ok) throw new Error(data.error||data.description||data.__proxy_error||('HTTP '+res.status));
@@ -552,13 +616,21 @@ async function doAppLogin(){
     document.getElementById('topbar-role').textContent  = d.role;
     document.getElementById('topbar-role').className    = 'role-badge '+d.role;
     document.getElementById('btn-manage-users').style.display = S.isAdmin?'':'none';
+    document.getElementById('btn-settings').style.display       = S.isAdmin?'':'none';
     // Show hub/portal tabs for portal managers and admins
     document.getElementById('tab-hubs').style.display    = S.canPortals?'':'none';
     document.getElementById('tab-portals').style.display = S.canPortals?'':'none';
     log('Signed in as '+d.username+' ('+d.role+')','ok');
     showScreen('screen-dashboard');
+    // Fetch settings to get configured refresh interval (admin) or use default
+    if(S.isAdmin){
+      try{
+        const settings = await api('/app/settings','GET',null,true);
+        S.refreshInterval = settings.refresh_interval_seconds||30;
+      }catch(e){ S.refreshInterval=30; }
+    }
     doRefresh();
-    startRefresh();
+    startRefresh(S.refreshInterval);
   }catch(e){ showErr(errEl,e.message); }
   finally{ btn.disabled=false; document.getElementById('login-btn-text').textContent='SIGN IN'; }
 }
@@ -584,19 +656,26 @@ function switchTab(tab){
 }
 
 // ══ REFRESH ════════════════════════════════════════════════════════════
-function startRefresh(){
-  S.countdown=30; updateCountdown();
+function startRefresh(interval){
+  S.refreshInterval = interval || S.refreshInterval || 30;
+  S.countdown = S.refreshInterval;
+  updateCountdown();
   S.countdownInt = setInterval(()=>{
     S.countdown--;
     updateCountdown();
-    if(S.countdown<=0){ S.countdown=30; doRefresh(); }
+    if(S.countdown<=0){ S.countdown=S.refreshInterval; doRefresh(); }
   },1000);
+}
+
+function restartRefresh(interval){
+  clearInterval(S.countdownInt);
+  startRefresh(interval);
 }
 function updateCountdown(){
   const el=document.getElementById('countdown-num');
   const fill=document.getElementById('refresh-fill');
   if(el)   el.textContent=S.countdown;
-  if(fill) fill.style.width=(S.countdown/30*100)+'%';
+  if(fill) fill.style.width=(S.countdown/S.refreshInterval*100)+'%';
 }
 async function doRefresh(){
   // Fetch spokes first — this may auto-register new hubs discovered via portal data.
@@ -649,17 +728,21 @@ async function fetchSpokeData(spoke){
       const discoveredHubs = {};
       spArr.forEach(e=>{
         if(e.hub_address){
-          const port = e.hub_port||8000;
-          const host = port===8000 ? e.hub_address : e.hub_address+':'+port;
+          // Normalize: strip replication port, always use API port 8000
+          const host = normalizeHubHost(e.hub_address);
           discoveredHubs[host] = host;
         }
       });
       for(const [host] of Object.entries(discoveredHubs)){
-        const alreadyKnown = S.hubs.some(h=>h.host===host);
+        // Check both in-memory list and by host to avoid duplicates across refreshes
+        const alreadyKnown = S.hubs.some(h=>normalizeHubHost(h.host)===host);
         if(!alreadyKnown){
           try{
             const d = await api('/app/hubs','POST',{name:host, host:host},true);
-            S.hubs.push({id:d.id, name:d.name, host:d.host, has_token:false, token_expired:false});
+            // Only push if not already in S.hubs (server deduplicates, may return existing)
+            if(!S.hubs.some(h=>h.id===d.id)){
+              S.hubs.push({id:d.id, name:d.name, host:d.host, has_token:false, token_expired:false});
+            }
             log('Discovered hub: '+host+' (from spoke '+spoke.name+')','info');
           }catch(e){
             if(!e.message.includes('already exists')) log('Could not register hub '+host+': '+e.message,'warn');
@@ -737,7 +820,9 @@ function renderSpokeCard(spoke){
 async function fetchHubs(){
   try{
     const d = await api('/app/hubs','GET',null,true);
-    S.hubs = d.hubs||[];
+    // Deduplicate by host in case any slipped through
+    const seen = new Set();
+    S.hubs = (d.hubs||[]).filter(h=>{ if(seen.has(h.host)) return false; seen.add(h.host); return true; });
     await Promise.all(S.hubs.map(fetchHubData));
     renderHubsPanel();
   }catch(e){ log('Hubs error: '+e.message,'err'); }
@@ -932,7 +1017,11 @@ async function doAddHub(){
 function openAuth(type, id, isExpired){
   const list   = type==='spoke'?S.spokes:S.hubs;
   const item   = list.find(x=>x.id===id);
-  if(!item) return;
+  if(!item){
+    log('Could not find '+type+' '+id+' in local list — try refreshing','err');
+    console.error('openAuth: '+type+' not found. id='+id+' list='+JSON.stringify(list.map(x=>x.id)));
+    return;
+  }
   S.authType    = type;
   S.authId      = id;
   S.authExpired = isExpired;
@@ -950,11 +1039,22 @@ async function doAuth(){
   const btn      = document.getElementById('auth-submit');
   const err      = document.getElementById('auth-error');
   if(!username||!password){ showErr(err,'Username and password required.'); return; }
+  if(!S.authType || !S.authId){
+    showErr(err,'Auth context lost — please close and re-open the authenticate dialog.');
+    return;
+  }
   btn.disabled=true; btn.querySelector('span').textContent='AUTHENTICATING...';
   err.style.display='none';
+  console.log('doAuth: type='+S.authType+' id='+S.authId+' token='+!!S.sessionToken);
   try{
     const endpoint = S.authType==='spoke'?'/app/spokes/':'/app/hubs/';
     const d = await api(endpoint+S.authId+'/auth','POST',{username,password},true);
+    // Update the cluster name in local state if the server returned one
+    if(d.name){
+      const list = S.authType==='spoke'?S.spokes:S.hubs;
+      const item = list.find(x=>x.id===S.authId);
+      if(item) item.name = d.name;
+    }
     log((S.authType==='spoke'?'Spoke':'Hub')+' authenticated, expires '+fmtDate(d.token_expires),'ok');
     closeModal('modal-auth');
     await doRefresh();
@@ -977,7 +1077,6 @@ async function doRemoveCluster(type, id){
 
 // ══ CREATE PORTAL ══════════════════════════════════════════════════════
 function openCreatePortal(){
-  // Populate selects
   const ss = document.getElementById('portal-spoke-select');
   const hs = document.getElementById('portal-hub-select');
   ss.innerHTML = S.spokes.filter(s=>s.has_token&&!s.token_expired)
@@ -986,23 +1085,86 @@ function openCreatePortal(){
     .map(h=>'<option value="'+h.id+'">'+esc(h.name)+' ('+esc(h.host)+')</option>').join('');
   if(!ss.innerHTML) ss.innerHTML='<option value="">— No authenticated spokes —</option>';
   if(!hs.innerHTML) hs.innerHTML='<option value="">— No authenticated hubs —</option>';
+  document.getElementById('portal-hub-select-wrap').style.display = '';
+  document.getElementById('portal-hub-add-wrap').style.display    = 'none';
+  document.getElementById('portal-hub-toggle').textContent        = '+ ADD NEW HUB';
+  document.getElementById('portal-hub-add-name').value='';
+  document.getElementById('portal-hub-add-host').value='';
+  document.getElementById('portal-hub-add-pass').value='';
+  document.getElementById('portal-hub-add-error').style.display='none';
   document.getElementById('portal-spoke-root').value='';
   document.getElementById('portal-hub-root').value='';
+  document.getElementById('portal-hub-rep-port').value='3713';
+  document.getElementById('portal-spoke-rep-port').value='3713';
+  document.getElementById('portal-type').value='PORTAL_READ_WRITE';
   document.getElementById('portal-error').style.display='none';
   document.getElementById('modal-create-portal').classList.add('open');
 }
+
+function togglePortalHubInput(){
+  const selectWrap = document.getElementById('portal-hub-select-wrap');
+  const addWrap    = document.getElementById('portal-hub-add-wrap');
+  const toggle     = document.getElementById('portal-hub-toggle');
+  const showing    = addWrap.style.display !== 'none';
+  selectWrap.style.display = showing ? '' : 'none';
+  addWrap.style.display    = showing ? 'none' : '';
+  toggle.textContent       = showing ? '+ ADD NEW HUB' : '← USE EXISTING HUB';
+  document.getElementById('portal-hub-add-error').style.display='none';
+}
+
+async function doPortalAddHub(){
+  const name = document.getElementById('portal-hub-add-name').value.trim();
+  const host = document.getElementById('portal-hub-add-host').value.trim();
+  const pass = document.getElementById('portal-hub-add-pass').value;
+  const errEl= document.getElementById('portal-hub-add-error');
+  errEl.style.display='none';
+  if(!host||!pass){ errEl.textContent='Host and password are required.'; errEl.style.display='block'; return; }
+  const btn = document.querySelector('#portal-hub-add-wrap button');
+  btn.disabled=true; btn.querySelector('span').textContent='ADDING...';
+  try{
+    // Register the hub
+    const d = await api('/app/hubs','POST',{name:name||host, host},true);
+    // Authenticate it
+    const authEl = document.getElementById('auth-username');
+    const quUser = authEl ? authEl.value.trim() : 'admin';
+    const a = await api('/app/hubs/'+d.id+'/auth','POST',{username:quUser, password:pass},true);
+    // Add to S.hubs and refresh the hub select
+    if(!S.hubs.some(h=>h.id===d.id)){
+      S.hubs.push({id:d.id, name:a.name||d.name, host:d.host, has_token:true, token_expired:false, token_expires:a.token_expires});
+    } else {
+      const h = S.hubs.find(h=>h.id===d.id);
+      if(h){ h.has_token=true; h.token_expired=false; if(a.name) h.name=a.name; }
+    }
+    log('Hub added and authenticated: '+(a.name||d.name),'ok');
+    // Rebuild the hub select and switch to it
+    const hs = document.getElementById('portal-hub-select');
+    hs.innerHTML = S.hubs.filter(h=>h.has_token&&!h.token_expired)
+      .map(h=>'<option value="'+h.id+'"'+(h.id===d.id?' selected':'')+'>'+esc(h.name)+' ('+esc(h.host)+')</option>').join('');
+    document.getElementById('portal-hub-select-wrap').style.display='';
+    document.getElementById('portal-hub-add-wrap').style.display='none';
+    document.getElementById('portal-hub-toggle').textContent='+ ADD NEW HUB';
+  }catch(e){
+    errEl.textContent='⚠ '+e.message;
+    errEl.style.display='block';
+  }finally{
+    btn.disabled=false; btn.querySelector('span').textContent='ADD & AUTH';
+  }
+}
 async function doCreatePortal(){
-  const spoke_id   = document.getElementById('portal-spoke-select').value;
-  const hub_id     = document.getElementById('portal-hub-select').value;
-  const spoke_root = document.getElementById('portal-spoke-root').value.trim();
-  const hub_root   = document.getElementById('portal-hub-root').value.trim();
-  const btn        = document.getElementById('portal-submit');
-  const err        = document.getElementById('portal-error');
+  const spoke_id              = document.getElementById('portal-spoke-select').value;
+  const hub_id                = document.getElementById('portal-hub-select').value;
+  const spoke_root            = document.getElementById('portal-spoke-root').value.trim();
+  const hub_root              = document.getElementById('portal-hub-root').value.trim();
+  const portal_type           = document.getElementById('portal-type').value;
+  const hub_replication_port  = parseInt(document.getElementById('portal-hub-rep-port').value)||3713;
+  const spoke_replication_port = parseInt(document.getElementById('portal-spoke-rep-port').value)||3713;
+  const btn                   = document.getElementById('portal-submit');
+  const err                   = document.getElementById('portal-error');
   if(!spoke_id||!hub_id||!spoke_root||!hub_root){ showErr(err,'All fields are required.'); return; }
   btn.disabled=true; btn.querySelector('span').textContent='CREATING...';
   err.style.display='none';
   try{
-    await api('/app/portals','POST',{spoke_id,hub_id,spoke_root,hub_root},true);
+    await api('/app/portals','POST',{spoke_id,hub_id,spoke_root,hub_root,portal_type,hub_replication_port,spoke_replication_port},true);
     log('Portal created: '+spoke_root+' → '+hub_root,'ok');
     closeModal('modal-create-portal');
     await doRefresh();
@@ -1088,6 +1250,48 @@ async function doDeleteUser(username){
   }catch(e){ log('Delete user error: '+e.message,'err'); }
 }
 
+// ══ HUB HOST NORMALIZATION ════════════════════════════════════════════
+// hub_port in portal data is the replication port, not the API port (8000)
+function normalizeHubHost(host){
+  if(!host) return host;
+  const colon = host.lastIndexOf(':');
+  if(colon === -1) return host;
+  const port = host.substring(colon+1);
+  if(port === '8000') return host.substring(0, colon); // 8000 is default, drop it
+  // Any other port is the replication port — strip it
+  return host.substring(0, colon);
+}
+
+// ══ SETTINGS ══════════════════════════════════════════════════════════
+async function doSettingsOpen(){
+  document.getElementById('settings-error').style.display='none';
+  try{
+    const d = await api('/app/settings','GET',null,true);
+    document.getElementById('settings-refresh').value = d.refresh_interval_seconds||30;
+  }catch(e){
+    document.getElementById('settings-refresh').value = S.refreshInterval||30;
+  }
+  document.getElementById('modal-settings').classList.add('open');
+  document.getElementById('settings-refresh').focus();
+}
+
+async function doSaveSettings(){
+  const val = parseInt(document.getElementById('settings-refresh').value);
+  const err = document.getElementById('settings-error');
+  const btn = document.getElementById('settings-submit');
+  err.style.display='none';
+  if(isNaN(val)||val<5||val>3600){ showErr(err,'Refresh interval must be between 5 and 3600 seconds.'); return; }
+  btn.disabled=true; btn.querySelector('span').textContent='SAVING...';
+  try{
+    const d = await api('/app/settings','PATCH',{refresh_interval_seconds:val},true);
+    S.refreshInterval = d.refresh_interval_seconds;
+    restartRefresh(S.refreshInterval);
+    log('Settings saved: refresh every '+S.refreshInterval+'s','ok');
+    closeModal('modal-settings');
+  }catch(e){ showErr(err,e.message); }
+  finally{ btn.disabled=false; btn.querySelector('span').textContent='SAVE SETTINGS'; }
+}
+
 // ══ CHANGE PASSWORD ═══════════════════════════════════════════════════
 // Called from top bar — change own password
 function doChangePwOpen(){
@@ -1157,7 +1361,7 @@ async function doAdminChangePassword(username){
 // ══ KEYBOARD ═══════════════════════════════════════════════════════════
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){
-    ['modal-add-spoke','modal-add-hub','modal-auth','modal-create-portal','modal-users','modal-change-pw']
+    ['modal-add-spoke','modal-add-hub','modal-auth','modal-create-portal','modal-users','modal-change-pw','modal-settings']
       .forEach(id=>document.getElementById(id).classList.remove('open'));
   }
 });
