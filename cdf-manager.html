@@ -389,7 +389,27 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
       <div class="field" style="margin:0">
         <label>SPOKE CLUSTER</label>
-        <select id="portal-spoke-select"></select>
+        <div id="portal-spoke-select-wrap">
+          <select id="portal-spoke-select"></select>
+        </div>
+        <div id="portal-spoke-add-wrap" style="display:none">
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input type="text" id="portal-spoke-add-name" placeholder="Name (optional)" style="flex:1"/>
+            <input type="text" id="portal-spoke-add-host" placeholder="10.x.x.x" style="flex:1"/>
+          </div>
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input type="text" id="portal-spoke-add-user" placeholder="Qumulo username" value="admin" style="flex:1"/>
+            <input type="password" id="portal-spoke-add-pass" placeholder="Qumulo password" style="flex:1"/>
+          </div>
+          <button class="btn sm" onclick="doPortalAddSpoke()" style="width:100%"><span>ADD &amp; AUTHENTICATE SPOKE</span></button>
+          <div id="portal-spoke-add-error" style="font-family:var(--mono);font-size:11px;color:var(--danger);margin-top:6px;display:none"></div>
+        </div>
+        <div style="margin-top:5px">
+          <span id="portal-spoke-toggle" onclick="togglePortalSpokeInput()"
+            style="font-family:var(--mono);font-size:10px;color:var(--accent);cursor:pointer;letter-spacing:1px">
+            + ADD NEW SPOKE
+          </span>
+        </div>
       </div>
       <div class="field" style="margin:0">
         <label>HUB CLUSTER</label>
@@ -401,10 +421,11 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
             <input type="text" id="portal-hub-add-name" placeholder="Name (optional)" style="flex:1"/>
             <input type="text" id="portal-hub-add-host" placeholder="10.x.x.x" style="flex:1"/>
           </div>
-          <div style="display:flex;gap:6px">
-            <input type="password" id="portal-hub-add-pass" placeholder="Qumulo password"/>
-            <button class="btn sm" onclick="doPortalAddHub()" style="flex-shrink:0"><span>ADD &amp; AUTH</span></button>
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input type="text" id="portal-hub-add-user" placeholder="Qumulo username" value="admin" style="flex:1"/>
+            <input type="password" id="portal-hub-add-pass" placeholder="Qumulo password" style="flex:1"/>
           </div>
+          <button class="btn sm" onclick="doPortalAddHub()" style="width:100%"><span>ADD &amp; AUTHENTICATE HUB</span></button>
           <div id="portal-hub-add-error" style="font-family:var(--mono);font-size:11px;color:var(--danger);margin-top:6px;display:none"></div>
         </div>
         <div style="margin-top:5px">
@@ -582,8 +603,14 @@ async function api(path, method, body, auth=true){
   // Only treat 401 as session expiry on authenticated calls — not on login itself
   // Only treat 401 as session expiry for app-level calls, not cluster auth endpoints
   const isClusterAuth = path.includes('/auth') || path === '/app/me/password';
-  if(res.status===401 && auth && path !== '/app/login' && !isClusterAuth){
-    log('Session expired','warn'); doForceLogout(); throw new Error('Session expired');
+  const isProxyCall   = path === '/proxy';
+  if(res.status===401 && auth && path !== '/app/login' && !isClusterAuth && !isProxyCall){
+    console.error('401 on path:', path, 'sessionToken:', !!S.sessionToken, 'data:', data);
+    if(S.sessionToken){
+      log('Session expired — please sign in again','warn');
+      doForceLogout();
+    }
+    throw new Error(data.error||'Session expired — please log in again');
   }
   if(!res.ok) throw new Error(data.error||data.description||data.__proxy_error||('HTTP '+res.status));
   return data;
@@ -624,15 +651,17 @@ async function doAppLogin(){
     document.getElementById('tab-portals').style.display = S.canPortals?'':'none';
     log('Signed in as '+d.username+' ('+d.role+')','ok');
     showScreen('screen-dashboard');
-    // Fetch settings to get configured refresh interval (admin) or use default
+    btn.disabled=false; document.getElementById('login-btn-text').textContent='SIGN IN';
+    // Everything after this point runs post-login — errors must NOT send back to login screen
     if(S.isAdmin){
       try{
         const settings = await api('/app/settings','GET',null,true);
         S.refreshInterval = settings.refresh_interval_seconds||30;
       }catch(e){ S.refreshInterval=30; }
     }
-    doRefresh();
+    try{ await doRefresh(); }catch(e){ log('Initial refresh error: '+e.message,'warn'); }
     startRefresh(S.refreshInterval);
+    return; // prevent finally from re-enabling button twice
   }catch(e){ showErr(errEl,e.message); }
   finally{ btn.disabled=false; document.getElementById('login-btn-text').textContent='SIGN IN'; }
 }
@@ -640,11 +669,13 @@ async function doAppLogin(){
 function doAppLogout(){ api('/app/logout','POST',{},true).catch(()=>{}); doForceLogout(); }
 function doForceLogout(){
   clearInterval(S.countdownInt);
+  const wasLoggedIn = !!S.sessionToken;
   S = { sessionToken:null,username:null,role:null,isAdmin:false,canPortals:false,
         spokes:[],hubs:[],activeTab:'spokes',countdown:30,countdownInt:null,
-        authType:null,authId:null,authExpired:false };
+        authType:null,authId:null,authExpired:false,refreshInterval:30 };
   document.getElementById('login-password').value='';
-  showScreen('screen-login');
+  // Only redirect to login if we were actually logged in — prevents boot loop
+  if(wasLoggedIn) showScreen('screen-login');
 }
 
 // ══ TABS ═══════════════════════════════════════════════════════════════
@@ -698,7 +729,9 @@ async function fetchSpokes(){
     S.spokes = d.spokes||[];
     await Promise.all(S.spokes.map(fetchSpokeData));
     renderSpokesPanel();
-  }catch(e){ log('Spokes error: '+e.message,'err'); }
+  }catch(e){
+    if(!e.message.includes('Session expired')) log('Spokes error: '+e.message,'err');
+  }
 }
 
 async function fetchSpokeData(spoke){
@@ -1126,7 +1159,16 @@ function openCreatePortal(){
   document.getElementById('portal-hub-toggle').textContent        = '+ ADD NEW HUB';
   document.getElementById('portal-hub-add-name').value='';
   document.getElementById('portal-hub-add-host').value='';
+  document.getElementById('portal-hub-add-user').value='admin';
   document.getElementById('portal-hub-add-pass').value='';
+  document.getElementById('portal-spoke-add-name').value='';
+  document.getElementById('portal-spoke-add-host').value='';
+  document.getElementById('portal-spoke-add-user').value='admin';
+  document.getElementById('portal-spoke-add-pass').value='';
+  document.getElementById('portal-spoke-add-error').style.display='none';
+  document.getElementById('portal-spoke-select-wrap').style.display='';
+  document.getElementById('portal-spoke-add-wrap').style.display='none';
+  document.getElementById('portal-spoke-toggle').textContent='+ ADD NEW SPOKE';
   document.getElementById('portal-hub-add-error').style.display='none';
   document.getElementById('portal-spoke-root').value='';
   document.getElementById('portal-hub-root').value='';
@@ -1148,6 +1190,51 @@ function togglePortalHubInput(){
   document.getElementById('portal-hub-add-error').style.display='none';
 }
 
+function togglePortalSpokeInput(){
+  const selectWrap = document.getElementById('portal-spoke-select-wrap');
+  const addWrap    = document.getElementById('portal-spoke-add-wrap');
+  const toggle     = document.getElementById('portal-spoke-toggle');
+  const showing    = addWrap.style.display !== 'none';
+  selectWrap.style.display = showing ? '' : 'none';
+  addWrap.style.display    = showing ? 'none' : '';
+  toggle.textContent       = showing ? '+ ADD NEW SPOKE' : '← USE EXISTING SPOKE';
+  document.getElementById('portal-spoke-add-error').style.display='none';
+}
+
+async function doPortalAddSpoke(){
+  const name  = document.getElementById('portal-spoke-add-name').value.trim();
+  const host  = document.getElementById('portal-spoke-add-host').value.trim();
+  const user  = document.getElementById('portal-spoke-add-user').value.trim() || 'admin';
+  const pass  = document.getElementById('portal-spoke-add-pass').value;
+  const errEl = document.getElementById('portal-spoke-add-error');
+  errEl.style.display='none';
+  if(!host||!pass){ errEl.textContent='Host and password are required.'; errEl.style.display='block'; return; }
+  const btn = document.querySelector('#portal-spoke-add-wrap button');
+  btn.disabled=true; btn.querySelector('span').textContent='ADDING...';
+  try{
+    const d = await api('/app/spokes','POST',{name:name||host, host},true);
+    const a = await api('/app/spokes/'+d.id+'/auth','POST',{username:user, password:pass},true);
+    if(!S.spokes.some(s=>s.id===d.id)){
+      S.spokes.push({id:d.id, name:a.name||d.name, host:d.host, has_token:true, token_expired:false, token_expires:a.token_expires});
+    } else {
+      const s = S.spokes.find(s=>s.id===d.id);
+      if(s){ s.has_token=true; s.token_expired=false; if(a.name) s.name=a.name; }
+    }
+    log('Spoke added and authenticated: '+(a.name||d.name),'ok');
+    const ss = document.getElementById('portal-spoke-select');
+    ss.innerHTML = S.spokes.filter(s=>s.has_token&&!s.token_expired)
+      .map(s=>'<option value="'+s.id+'"'+(s.id===d.id?' selected':'')+'>'+esc(s.name)+' ('+esc(s.host)+')</option>').join('');
+    document.getElementById('portal-spoke-select-wrap').style.display='';
+    document.getElementById('portal-spoke-add-wrap').style.display='none';
+    document.getElementById('portal-spoke-toggle').textContent='+ ADD NEW SPOKE';
+  }catch(e){
+    errEl.textContent='⚠ '+e.message;
+    errEl.style.display='block';
+  }finally{
+    btn.disabled=false; btn.querySelector('span').textContent='ADD & AUTHENTICATE SPOKE';
+  }
+}
+
 async function doPortalAddHub(){
   const name = document.getElementById('portal-hub-add-name').value.trim();
   const host = document.getElementById('portal-hub-add-host').value.trim();
@@ -1162,7 +1249,7 @@ async function doPortalAddHub(){
     const d = await api('/app/hubs','POST',{name:name||host, host},true);
     // Authenticate it
     const authEl = document.getElementById('auth-username');
-    const quUser = authEl ? authEl.value.trim() : 'admin';
+    const quUser = document.getElementById('portal-hub-add-user').value.trim() || 'admin';
     const a = await api('/app/hubs/'+d.id+'/auth','POST',{username:quUser, password:pass},true);
     // Add to S.hubs and refresh the hub select
     if(!S.hubs.some(h=>h.id===d.id)){
