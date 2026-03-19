@@ -388,30 +388,6 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
     <div class="modal-subtitle">The app will create the spoke entry, set root paths, then automatically approve on the hub.</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
       <div class="field" style="margin:0">
-        <label>SPOKE CLUSTER</label>
-        <div id="portal-spoke-select-wrap">
-          <select id="portal-spoke-select"></select>
-        </div>
-        <div id="portal-spoke-add-wrap" style="display:none">
-          <div style="display:flex;gap:6px;margin-bottom:6px">
-            <input type="text" id="portal-spoke-add-name" placeholder="Name (optional)" style="flex:1"/>
-            <input type="text" id="portal-spoke-add-host" placeholder="10.x.x.x" style="flex:1"/>
-          </div>
-          <div style="display:flex;gap:6px;margin-bottom:6px">
-            <input type="text" id="portal-spoke-add-user" placeholder="Qumulo username" value="admin" style="flex:1"/>
-            <input type="password" id="portal-spoke-add-pass" placeholder="Qumulo password" style="flex:1"/>
-          </div>
-          <button class="btn sm" onclick="doPortalAddSpoke()" style="width:100%"><span>ADD &amp; AUTHENTICATE SPOKE</span></button>
-          <div id="portal-spoke-add-error" style="font-family:var(--mono);font-size:11px;color:var(--danger);margin-top:6px;display:none"></div>
-        </div>
-        <div style="margin-top:5px">
-          <span id="portal-spoke-toggle" onclick="togglePortalSpokeInput()"
-            style="font-family:var(--mono);font-size:10px;color:var(--accent);cursor:pointer;letter-spacing:1px">
-            + ADD NEW SPOKE
-          </span>
-        </div>
-      </div>
-      <div class="field" style="margin:0">
         <label>HUB CLUSTER</label>
         <div id="portal-hub-select-wrap">
           <select id="portal-hub-select"></select>
@@ -435,15 +411,39 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
           </span>
         </div>
       </div>
+      <div class="field" style="margin:0">
+        <label>SPOKE CLUSTER</label>
+        <div id="portal-spoke-select-wrap">
+          <select id="portal-spoke-select"></select>
+        </div>
+        <div id="portal-spoke-add-wrap" style="display:none">
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input type="text" id="portal-spoke-add-name" placeholder="Name (optional)" style="flex:1"/>
+            <input type="text" id="portal-spoke-add-host" placeholder="10.x.x.x" style="flex:1"/>
+          </div>
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input type="text" id="portal-spoke-add-user" placeholder="Qumulo username" value="admin" style="flex:1"/>
+            <input type="password" id="portal-spoke-add-pass" placeholder="Qumulo password" style="flex:1"/>
+          </div>
+          <button class="btn sm" onclick="doPortalAddSpoke()" style="width:100%"><span>ADD &amp; AUTHENTICATE SPOKE</span></button>
+          <div id="portal-spoke-add-error" style="font-family:var(--mono);font-size:11px;color:var(--danger);margin-top:6px;display:none"></div>
+        </div>
+        <div style="margin-top:5px">
+          <span id="portal-spoke-toggle" onclick="togglePortalSpokeInput()"
+            style="font-family:var(--mono);font-size:10px;color:var(--accent);cursor:pointer;letter-spacing:1px">
+            + ADD NEW SPOKE
+          </span>
+        </div>
+      </div>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px">
       <div class="field" style="margin:0">
-        <label>SPOKE ROOT PATH</label>
-        <input type="text" id="portal-spoke-root" placeholder="/Videos"/>
-      </div>
-      <div class="field" style="margin:0">
         <label>HUB ROOT PATH</label>
         <input type="text" id="portal-hub-root" placeholder="/Videos"/>
+      </div>
+      <div class="field" style="margin:0">
+        <label>SPOKE ROOT PATH</label>
+        <input type="text" id="portal-spoke-root" placeholder="/Videos"/>
       </div>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:14px">
