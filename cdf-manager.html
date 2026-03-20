@@ -950,7 +950,9 @@ async function renderPortalsTab(){
   for(const spoke of S.spokes){
     if(!spoke.portalRows) continue;
     for(const r of spoke.portalRows){
-      rows.push({...r, spokeName:spoke.name, spokeHost:spoke.host, spokeId:spoke.id, totalCap:spoke.totalCap||0});
+      const matchedHub = S.hubs.find(h=>h.host===r.hubAddr||h.host===r.hubAddr.split(':')[0]);
+      rows.push({...r, spokeName:spoke.name, spokeHost:spoke.host, spokeId:spoke.id,
+                 totalCap:spoke.totalCap||0, hubName:matchedHub?matchedHub.name:null});
     }
   }
 
@@ -977,7 +979,10 @@ async function renderPortalsTab(){
       return '<tr>'
         +'<td>'+esc(r.spokeName)+'<div class="dim" style="font-size:10px">'+esc(r.spokeHost)+'</div></td>'
         +'<td>'+esc(r.spokePath)+'</td>'
-        +'<td>'+esc(r.hubAddr)+'</td>'
+        +'<td>'+(r.hubName&&r.hubName!==r.hubAddr
+            ?'<div style="font-family:var(--cond);font-size:13px;font-weight:700;color:var(--text-bright)">'+esc(r.hubName)+'</div>'
+             +'<div class="dim" style="font-size:10px">'+esc(r.hubAddr)+'</div>'
+            :esc(r.hubAddr))+'</td>'
         +'<td class="dim">'+esc(r.spokeType)+'</td>'
         +'<td class="dim">'+esc(r.state)+'</td>'
         +'<td><span style="color:'+stCol+'">'+esc(r.status)+'</span></td>'
