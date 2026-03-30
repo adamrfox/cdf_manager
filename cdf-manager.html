@@ -616,8 +616,8 @@ async function api(path, method, body, auth=true){
   return data;
 }
 
-async function proxyCall(host, apiPath, method, spokeId, hubId){
-  return api('/proxy','POST',{host, path:apiPath, method:method||'GET', spoke_id:spokeId||'', hub_id:hubId||''});
+async function proxyCall(host, apiPath, method, spokeId, hubId, body){
+  return api('/proxy','POST',{host, path:apiPath, method:method||'GET', spoke_id:spokeId||'', hub_id:hubId||'', body:body||null});
 }
 
 // ══ LOGIN / LOGOUT ═════════════════════════════════════════════════════
@@ -647,8 +647,8 @@ async function doAppLogin(){
     document.getElementById('btn-manage-users').style.display = S.isAdmin?'':'none';
     document.getElementById('btn-settings').style.display       = S.isAdmin?'':'none';
     // Show hub/portal tabs for portal managers and admins
-    document.getElementById('tab-hubs').style.display    = S.canPortals?'':'none';
-    document.getElementById('tab-portals').style.display = S.canPortals?'':'none';
+    document.getElementById('tab-hubs').style.display    = '';  // visible to all roles
+    document.getElementById('tab-portals').style.display = '';  // visible to all roles
     log('Signed in as '+d.username+' ('+d.role+')','ok');
     showScreen('screen-dashboard');
     btn.disabled=false; document.getElementById('login-btn-text').textContent='SIGN IN';
@@ -715,10 +715,9 @@ async function doRefresh(){
   S.countdown = S.refreshInterval||30;
   updateCountdown();
   await fetchSpokes();
-  if(S.canPortals){
-    await fetchHubs();
-    renderHubsPanel();
-  }
+  // Hubs tab visible to all roles — but only portal_manager+ can add/remove hubs
+  await fetchHubs();
+  renderHubsPanel();
   if(S.activeTab==='portals') renderPortalsTab();
 }
 
@@ -745,18 +744,24 @@ async function fetchSpokeData(spoke){
     spoke.totalCap  = parseInt(fs.total_size_bytes||0);
     spoke.totalFree = parseInt(fs.free_size_bytes||0);
     spoke.totalUsed = spoke.totalCap - spoke.totalFree;
-    const spokeMap  = {};
-    const fsArr = Array.isArray(pf) ? pf : (Array.isArray(pf.entries) ? pf.entries : []);
-    const spArr = Array.isArray(ps) ? ps : (Array.isArray(ps.entries) ? ps.entries : []);
-    spArr.forEach(e=>{ if(e.hub_cluster_uuid) spokeMap[e.hub_cluster_uuid]=e; });
-    // merge by uuid
-    spoke.portalRows = fsArr.map(f=>{
-      const sp = spArr.find(s=>s.hub_cluster_uuid===f.uuid)||{};
-      return { uuid:f.uuid, usedBytes:parseInt(f.usage_bytes||0),
-               spokePath:sp.spoke_root_path||'—', hubAddr:sp.hub_address||'—',
-               hubPort:sp.hub_port||8000,
-               status:sp.status||'—', state:sp.state||'—', spokeType:sp.spoke_type||'—',
-               spokeEntryId: sp.id||'' };
+    // Build rows from spArr (portal/spokes) — includes PENDING entries that
+    // won't appear in portal/file-systems yet. Look up usage from fsArr by uuid.
+    const fsArr  = Array.isArray(pf) ? pf : (Array.isArray(pf.entries) ? pf.entries : []);
+    const spArr  = Array.isArray(ps) ? ps : (Array.isArray(ps.entries) ? ps.entries : []);
+    const usageMap = {};
+    fsArr.forEach(f=>{ usageMap[f.uuid] = parseInt(f.usage_bytes||0); });
+
+    spoke.portalRows = spArr.map(sp=>{
+      return { uuid:          sp.hub_cluster_uuid||'',
+               usedBytes:     usageMap[sp.hub_cluster_uuid]||0,
+               spokePath:     sp.spoke_root_path||'—',
+               hubAddr:       sp.hub_address||'—',
+               hubPath:       sp.hub_root||'—',
+               hubPort:       sp.hub_port||3713,
+               status:        sp.status||'—',
+               state:         sp.state||'—',
+               spokeType:     sp.spoke_type||sp.spoke_type||'—',
+               spokeEntryId:  sp.id||'' };
     });
 
     // Auto-register hubs discovered via portal relationships
@@ -785,6 +790,50 @@ async function fetchSpokeData(spoke){
           }
         }
       }
+    }
+
+    // Resolve hub root paths for authenticated hubs
+    // hubPath currently holds a file ID — resolve it to a real path via /v1/files/resolve
+    const rowsNeedingResolve = spoke.portalRows.filter(r=>r.hubPath&&r.hubPath!=='—'&&r.hubAddr&&r.hubAddr!=='—');
+    if(rowsNeedingResolve.length){
+      // Group by hub address so we make one resolve call per hub
+      const byHub = {};
+      rowsNeedingResolve.forEach(r=>{
+        const hubHost = normalizeHubHost(r.hubAddr);
+        if(!byHub[hubHost]) byHub[hubHost] = [];
+        byHub[hubHost].push(r);
+      });
+      await Promise.all(Object.entries(byHub).map(async ([hubHost, rows])=>{
+        const hub = S.hubs.find(h=>normalizeHubHost(h.host)===hubHost);
+        if(!hub||!hub.has_token||hub.token_expired) return; // hub not authenticated — leave blank
+        const ids = rows.map(r=>r.hubPath).filter(id=>id&&id!=='—');
+        if(!ids.length) return;
+        try{
+          const res = await api('/proxy','POST',{
+            host:    hubHost,
+            path:    '/v1/files/resolve',
+            method:  'POST',
+            hub_id:  hub.id,
+            body:    ids
+          }, true);
+          // res is an array of {id, path}
+          const pathMap = {};
+          (Array.isArray(res)?res:[]).forEach(e=>{ if(e.id&&e.path) pathMap[e.id]=e.path; });
+          rows.forEach(r=>{ if(pathMap[r.hubPath]) r.hubPath = pathMap[r.hubPath]; });
+        }catch(e){
+          console.warn('hub path resolve failed:', e.message);
+          rows.forEach(r=>{ r.hubPath = ''; });
+        }
+      }));
+    } else {
+      // No hub paths to resolve — blank out any that are just file IDs for unauthenticated hubs
+      spoke.portalRows.forEach(r=>{
+        if(r.hubPath&&r.hubPath!=='—'){
+          const hubHost = normalizeHubHost(r.hubAddr);
+          const hub = S.hubs.find(h=>normalizeHubHost(h.host)===hubHost);
+          if(!hub||!hub.has_token||hub.token_expired) r.hubPath = '';
+        }
+      });
     }
 
     spoke.fetchError = null;
@@ -821,7 +870,8 @@ function renderSpokeCard(spoke){
       +'</div>'
       +'<div class="usage-bar-track"><div class="usage-bar-fill" style="width:'+pct(r.usedBytes,cap).toFixed(1)+'%;background:'+barCol(pct(r.usedBytes,cap))+'"></div></div>'
       +'<div style="font-family:var(--mono);font-size:10px;color:var(--text-dim)">'
-      +esc(r.spokeType)+' · hub: '+esc(r.hubAddr)+' <span style="color:'+stCol+'">'+esc(r.status)+'</span>'
+      +esc(r.spokeType)+' · hub: '+esc(r.hubAddr)+(r.hubPath&&r.hubPath!=='—'?' → '+esc(r.hubPath):'')
+      +' <span style="color:'+(r.state==='PENDING'?'var(--warn)':stCol)+'">'+esc(r.state)+'/'+esc(r.status)+'</span>'
       +'</div></div>';
   }).join('');
 
@@ -848,7 +898,7 @@ function renderSpokeCard(spoke){
     +'</div>'
     +'<div class="cluster-card-actions">'
     +'<button class="btn xs warn" onclick="openAuth(\'spoke\',\''+spoke.id+'\',false)"><span>🔑 RE-AUTH</span></button>'
-    +'<button class="btn xs danger" onclick="doRemoveCluster(\'spoke\',\''+spoke.id+'\')"><span>REMOVE</span></button>'
+    +(S.canPortals?'<button class="btn xs danger" onclick="doRemoveCluster(\'spoke\',\''+spoke.id+'\')"><span>REMOVE</span></button>':'')
     +'</div></div>';
 }
 
@@ -967,7 +1017,7 @@ async function renderPortalsTab(){
 
   html += '<div style="overflow-x:auto"><table class="portal-table">'
     +'<thead><tr>'
-    +'<th>SPOKE CLUSTER</th><th>SPOKE PATH</th><th>HUB ADDRESS</th>'
+    +'<th>SPOKE CLUSTER</th><th>SPOKE PATH</th><th>HUB</th><th>HUB PATH</th>'
     +'<th>TYPE</th><th>STATE</th><th>STATUS</th><th>CAPACITY USED</th>'
     +(canCreate?'<th></th>':'')
     +'</tr></thead><tbody>'
@@ -983,8 +1033,9 @@ async function renderPortalsTab(){
             ?'<div style="font-family:var(--cond);font-size:13px;font-weight:700;color:var(--text-bright)">'+esc(r.hubName)+'</div>'
              +'<div class="dim" style="font-size:10px">'+esc(r.hubAddr)+'</div>'
             :esc(r.hubAddr))+'</td>'
+        +'<td>'+esc(r.hubPath||'—')+'</td>'
         +'<td class="dim">'+esc(r.spokeType)+'</td>'
-        +'<td class="dim">'+esc(r.state)+'</td>'
+        +'<td><span style="color:'+(r.state==='PENDING'?'var(--warn)':r.state==='ACCEPTED'?'var(--ok)':'var(--text-dim)')+'">'+esc(r.state)+'</span></td>'
         +'<td><span style="color:'+stCol+'">'+esc(r.status)+'</span></td>'
         +(function(){
           const p = r.totalCap ? Math.min(100, r.usedBytes/r.totalCap*100) : 0;

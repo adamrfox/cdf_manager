@@ -35,7 +35,7 @@ Endpoints:
   GET    /health                         — health check
 """
 
-import json, sys, os, ssl, uuid, hashlib, secrets
+import json, sys, os, ssl, uuid, hashlib, secrets, time
 import urllib.request, urllib.error, http.server
 from datetime import datetime, timedelta, timezone
 
@@ -309,8 +309,11 @@ def qumulo_request(host, path, method, token, body):
     if token:  print(f"      Auth: Bearer {token[:12]}...")
     else:       print(f"      Auth: NONE")
     if body:
-        safe = {k: ("***" if k == "password" else v) for k, v in (body.items() if isinstance(body, dict) else {})}
-        print(f"      Body: {json.dumps(safe)}")
+        if isinstance(body, dict):
+            safe = {k: ("***" if k == "password" else v) for k, v in body.items()}
+            print(f"      Body: {json.dumps(safe)}")
+        else:
+            print(f"      Body: {json.dumps(body)}")
 
     data = json.dumps(body).encode() if body else None
     req  = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -462,9 +465,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"spokes": [cluster_summary(k, v) for k, v in user["spokes"].items()]})
             return
 
-        # List hubs
+        # List hubs — visible to all roles, add/remove restricted in POST/DELETE
         if path == "/app/hubs":
-            username = self.require_portal_manager()
+            username = self.require_session()
             if not username: return
             user = get_user_state(username)
             self.send_json(200, {"hubs": [cluster_summary(k, v) for k, v in user["hubs"].items()]})
@@ -583,10 +586,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "username": new_user, "role": role})
             return
 
-        # Add a spoke
+        # Add a spoke — portal_manager and admin only
         if path == "/app/spokes":
             username = self.require_session()
             if not username: return
+            if get_role(username) == "monitor":
+                self.send_json(403, {"error": "Monitor role cannot add spokes."})
+                return
             host = payload.get("host", "").strip()
             name = payload.get("name", "").strip() or host
             if not host:
@@ -643,9 +649,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "token_expires": expires, "name": spoke.get("name", spoke["host"])})
             return
 
-        # Add a hub
+        # Add a hub — all roles can add hubs
         if path == "/app/hubs":
-            username = self.require_portal_manager()
+            username = self.require_session()
             if not username: return
             host = normalize_hub_host(payload.get("host", "").strip())
             name = payload.get("name", "").strip()
@@ -671,9 +677,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"id": hid, "name": name, "host": host})
             return
 
-        # Authenticate a hub
+        # Authenticate a hub — all roles
         if path.startswith("/app/hubs/") and path.endswith("/auth"):
-            username = self.require_portal_manager()
+            username = self.require_session()
             if not username: return
             hid  = path.split("/")[3]
             user = get_user_state(username)
@@ -743,13 +749,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             spoke_addr = spoke["host"].split(":")[0]
 
             # ── Step 1: Create spoke entry on the spoke cluster ───────────
+            # ── Step 0: Clean up any stale PENDING entries on both clusters ────
+            # This prevents leftover entries from failed attempts blocking step 3.
+            s0s, existing_spokes = qumulo_request(spoke["host"], "/v2/portal/spokes/", "GET", spoke_token, None)
+            if s0s < 400:
+                for es in (existing_spokes.get("entries") or []):
+                    if es.get("state") in ("PENDING",) and es.get("hub_address") == hub_addr:
+                        sid_del = es.get("id")
+                        print(f"  Portal step 0: deleting stale spoke entry id={sid_del}")
+                        qumulo_request(spoke["host"], f"/v2/portal/spokes/{sid_del}", "DELETE", spoke_token, None)
+            s0h, existing_hubs = qumulo_request(hub["host"], "/v2/portal/hubs/", "GET", hub_token, None)
+            if s0h < 400:
+                for eh in (existing_hubs.get("entries") or []):
+                    if eh.get("state") in ("PENDING",) and not eh.get("spoke_hosts"):
+                        hid_del = eh.get("id")
+                        print(f"  Portal step 0: deleting stale hub entry id={hid_del}")
+                        qumulo_request(hub["host"], f"/v2/portal/hubs/{hid_del}", "DELETE", hub_token, None)
+
             print(f"  Portal step 1: create spoke on {spoke['host']}")
             s1, spoke_entry = qumulo_request(
                 spoke["host"], "/v2/portal/spokes/", "POST", spoke_token,
                 {"type": portal_type, "hub_hosts": [{"address": hub_addr, "port": hub_replication_port}]}
             )
             if s1 >= 400:
-                self.send_json(s1, {"error": f"Step 1 failed: could not create spoke entry", "detail": spoke_entry})
+                qerr = spoke_entry.get("description") or spoke_entry.get("error_class") or spoke_entry.get("__raw") or str(spoke_entry)
+                self.send_json(s1, {"error": f"Step 1 failed: {qerr}"})
                 return
             spoke_entry_id = spoke_entry.get("id")
             print(f"  Portal step 1 OK: spoke entry id={spoke_entry_id}")
@@ -761,70 +785,72 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 {"spoke_root_path": spoke_root, "hub_root_path": hub_root}
             )
             if s2 >= 400:
-                self.send_json(s2, {"error": f"Step 2 failed: could not set root paths", "detail": roots_result})
+                qerr = roots_result.get("description") or roots_result.get("error_class") or roots_result.get("__raw") or str(roots_result)
+                self.send_json(s2, {"error": f"Step 2 failed: {qerr}"})
                 return
             print(f"  Portal step 2 OK: roots set")
 
             # ── Step 3: Find the pending hub entry on the hub cluster ─────
-            print(f"  Portal step 3: find pending hub entry on {hub['host']}")
-            s3, hubs_list = qumulo_request(hub["host"], "/v2/portal/hubs/", "GET", hub_token, None)
-            if s3 >= 400:
-                self.send_json(s3, {"error": f"Step 3 failed: could not list hub entries", "detail": hubs_list})
-                return
-            # Match by spoke_cluster_uuid from the spoke entry response
-            spoke_cluster_uuid = spoke_entry.get("hub_cluster_uuid") or ""
-            hub_entries = hubs_list.get("entries", [])
-            # Find the pending entry — match by state=PENDING and spoke cluster uuid if available
-            hub_entry = None
-            for entry in hub_entries:
-                if entry.get("state") == "PENDING":
-                    # If we have the spoke's cluster UUID, use it to match
-                    # Otherwise just take the first PENDING entry
-                    hub_entry = entry
-                    break
-            if not hub_entry:
-                self.send_json(500, {"error": "Step 3 failed: no pending hub entry found after spoke creation", "hub_entries": hub_entries})
-                return
-            hub_entry_id     = hub_entry.get("id")
-            pending_roots    = hub_entry.get("pending_roots", [])
-            print(f"  Portal step 3 OK: hub entry id={hub_entry_id} pending_roots={pending_roots}")
+            # Get the spoke's own cluster UUID from its cluster settings
+            # so we can correctly match against hub's spoke_cluster_uuid field.
+            s_uuid_s, spoke_cluster_info = qumulo_request(spoke["host"], "/v1/cluster/settings", "GET", spoke_token, None)
+            spoke_cluster_uuid = (spoke_cluster_info.get("cluster_id") or spoke_cluster_info.get("guid") or "") if s_uuid_s < 400 else ""
+            print(f"  Portal step 3: spoke_cluster_uuid={spoke_cluster_uuid}")
 
-            # ── Step 4: Accept the spoke on the hub cluster ───────────────
-            print(f"  Portal step 4: accept spoke on hub")
+            hub_entry     = None
+            hub_entry_id  = None
+            pending_roots = []
+            for attempt in range(8):
+                print(f"  Portal step 3 attempt {attempt+1}: scanning hub entries")
+                s3, hubs_list = qumulo_request(hub["host"], "/v2/portal/hubs/", "GET", hub_token, None)
+                if s3 >= 400:
+                    qerr = hubs_list.get("description") or hubs_list.get("error_class") or hubs_list.get("__raw") or str(hubs_list)
+                    self.send_json(s3, {"error": f"Step 3 failed: {qerr}"})
+                    return
+                hub_entries = hubs_list.get("entries", [])
+                print(f"  Portal step 3: hub entries: {[(e.get('id'), e.get('state'), e.get('spoke_cluster_uuid')) for e in hub_entries]}")
+                # Only match PENDING entries — skip already-accepted ones from previous attempts
+                # A PENDING entry with no spoke_hosts means it is waiting for our accept call
+                for entry in hub_entries:
+                    if entry.get("state") == "PENDING" and not entry.get("spoke_hosts"):
+                        if spoke_cluster_uuid and entry.get("spoke_cluster_uuid") == spoke_cluster_uuid:
+                            hub_entry = entry
+                            break
+                        elif not spoke_cluster_uuid:
+                            hub_entry = entry
+                            break
+                if hub_entry:
+                    break
+                if attempt < 7:
+                    print(f"  Portal step 3: no match yet, waiting 2s...")
+                    time.sleep(2)
+            if not hub_entry:
+                self.send_json(500, {"error": f"Step 3 failed: no matching hub entry found (spoke_uuid={spoke_cluster_uuid})", "hub_entries": hubs_list.get("entries", [])})
+                return
+            hub_entry_id  = hub_entry.get("id")
+            pending_roots = hub_entry.get("pending_roots", [])
+            print(f"  Portal step 3 OK: hub entry id={hub_entry_id} state={hub_entry.get('state')} pending_roots={pending_roots}")
+
+
+            # ── Step 4: Accept the spoke on the hub and authorize all pending roots ──
+            # Pass pending_roots as authorized_roots — equivalent to portal_accept_hub -A
+            # This both accepts the spoke and grants data access in one call.
+            print(f"  Portal step 4: accept spoke on hub with authorized_roots={pending_roots}")
             s4, accept_result = qumulo_request(
                 hub["host"], f"/v2/portal/hubs/{hub_entry_id}/accept", "POST", hub_token,
                 {"spoke_hosts": [{"address": spoke_addr, "port": spoke_replication_port}],
                  "authorized_roots": pending_roots}
             )
             if s4 >= 400:
-                self.send_json(s4, {"error": f"Step 4 failed: could not accept spoke on hub", "detail": accept_result})
+                qerr = accept_result.get("description") or accept_result.get("error_class") or accept_result.get("__raw") or str(accept_result)
+                self.send_json(s4, {"error": f"Step 4 failed: {qerr}"})
                 return
-            print(f"  Portal step 4 OK: spoke accepted, state={accept_result.get('state')}")
+            print(f"  Portal step 4 OK: state={accept_result.get('state')} status={accept_result.get('status')} authorized_roots={accept_result.get('authorized_roots')}")
 
-            # ── Step 5: Authorize any pending roots ───────────────────────
-            remaining_roots = accept_result.get("pending_roots", [])
-            if remaining_roots:
-                print(f"  Portal step 5: authorizing {len(remaining_roots)} pending root(s)")
-                final_result = accept_result
-                for root_id in remaining_roots:
-                    print(f"  Portal step 5: authorizing root {root_id}")
-                    s5, root_result = qumulo_request(
-                        hub["host"],
-                        f"/v2/portal/hubs/{hub_entry_id}/roots/{root_id}",
-                        "POST", hub_token, None
-                    )
-                    if s5 >= 400:
-                        self.send_json(s5, {"error": f"Step 5 failed: could not authorize root {root_id}", "detail": root_result})
-                        return
-                    final_result = root_result
-                    print(f"  Portal step 5 OK: root {root_id} authorized, status={root_result.get('status')}")
-            else:
-                final_result = accept_result
-                print(f"  Portal step 5: no pending roots to authorize")
-
-            print(f"  Portal created: spoke {spoke_id} ({spoke_addr}) -> hub {hub_id} ({hub_addr}), status={final_result.get('status')}")
-            self.send_json(200, {"ok": True, "spoke_entry": spoke_entry, "hub_entry": final_result})
+            print(f"  Portal created: spoke {spoke_id} ({spoke_addr}) -> hub {hub_id} ({hub_addr})")
+            self.send_json(200, {"ok": True, "spoke_entry": spoke_entry, "hub_entry": accept_result})
             return
+
 
         # Proxy a Qumulo API call
         if path == "/proxy":
@@ -979,10 +1005,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         print(f"\n[{self.client_address[0]}] DELETE {path}")
 
-        # Delete spoke
+        # Delete spoke — portal_manager and admin only
         if path.startswith("/app/spokes/"):
             username = self.require_session()
             if not username: return
+            if get_role(username) == "monitor":
+                self.send_json(403, {"error": "Monitor role cannot remove spokes."})
+                return
             sid  = path.split("/")[3]
             user = get_user_state(username)
             if sid not in user["spokes"]:
@@ -995,9 +1024,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True})
             return
 
-        # Delete hub
+        # Delete hub — all roles
         if path.startswith("/app/hubs/"):
-            username = self.require_portal_manager()
+            username = self.require_session()
             if not username: return
             hid  = path.split("/")[3]
             user = get_user_state(username)
