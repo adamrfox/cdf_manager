@@ -509,6 +509,14 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
         <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">min 5 · max 3600</span>
       </div>
     </div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:2px;margin:16px 0 12px">QUMULO TOKENS</div>
+    <div class="field">
+      <label>TOKEN EXPIRY (DAYS)</label>
+      <div style="display:flex;align-items:center;gap:12px">
+        <input type="number" id="settings-token-expiry" min="1" max="365" style="width:120px"/>
+        <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">min 1 · max 365 · applied to new authentications</span>
+      </div>
+    </div>
     <div class="error-msg" id="settings-error"></div>
     <div class="modal-actions">
       <button class="btn sm danger" onclick="closeModal('modal-settings')"><span>CANCEL</span></button>
@@ -1447,6 +1455,7 @@ async function doSettingsOpen(){
   try{
     const d = await api('/app/settings','GET',null,true);
     document.getElementById('settings-refresh').value = d.refresh_interval_seconds||30;
+    document.getElementById('settings-token-expiry').value = d.token_expiry_days||30;
   }catch(e){
     document.getElementById('settings-refresh').value = S.refreshInterval||30;
   }
@@ -1455,17 +1464,19 @@ async function doSettingsOpen(){
 }
 
 async function doSaveSettings(){
-  const val = parseInt(document.getElementById('settings-refresh').value);
+  const val      = parseInt(document.getElementById('settings-refresh').value);
+  const tokenVal = parseInt(document.getElementById('settings-token-expiry').value);
   const err = document.getElementById('settings-error');
   const btn = document.getElementById('settings-submit');
   err.style.display='none';
   if(isNaN(val)||val<5||val>3600){ showErr(err,'Refresh interval must be between 5 and 3600 seconds.'); return; }
+  if(isNaN(tokenVal)||tokenVal<1||tokenVal>365){ showErr(err,'Token expiry must be between 1 and 365 days.'); return; }
   btn.disabled=true; btn.querySelector('span').textContent='SAVING...';
   try{
-    const d = await api('/app/settings','PATCH',{refresh_interval_seconds:val},true);
+    const d = await api('/app/settings','PATCH',{refresh_interval_seconds:val, token_expiry_days:tokenVal},true);
     S.refreshInterval = d.refresh_interval_seconds;
     restartRefresh(S.refreshInterval);
-    log('Settings saved: refresh every '+S.refreshInterval+'s','ok');
+    log('Settings saved: refresh every '+S.refreshInterval+'s, token expiry '+d.token_expiry_days+'d','ok');
     closeModal('modal-settings');
   }catch(e){ showErr(err,e.message); }
   finally{ btn.disabled=false; btn.querySelector('span').textContent='SAVE SETTINGS'; }

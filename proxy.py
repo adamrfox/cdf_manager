@@ -103,6 +103,7 @@ sessions = load_sessions()
 # ── Settings persistence ───────────────────────────────────────────────
 DEFAULT_SETTINGS = {
     "refresh_interval_seconds": 30,
+    "token_expiry_days":        30,
 }
 
 def load_settings():
@@ -275,7 +276,8 @@ def get_bearer(headers):
 
 # ── Token expiry helpers ───────────────────────────────────────────────
 def make_expiry():
-    return (datetime.now(timezone.utc) + timedelta(days=QUMULO_TOKEN_EXPIRY_DAYS)).isoformat()
+    days = app_settings.get("token_expiry_days", QUMULO_TOKEN_EXPIRY_DAYS)
+    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
 def is_expired(iso_str):
     if not iso_str:
@@ -426,16 +428,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return username
 
     def auth_cluster(self, username, host, qu_user, qu_pass):
-        """Authenticate to a Qumulo cluster and return (token, expires, error)."""
+        """Authenticate to a Qumulo cluster and return (token, expires, error).
+        
+        Uses /v1/session/login to get a short-lived session token, then immediately
+        exchanges it for a long-lived access token via /v1/auth/access-tokens/ with
+        an explicit expiration_time matching our QUMULO_TOKEN_EXPIRY_DAYS setting.
+        Falls back to the session token if access token creation fails.
+        """
+        # Step 1: login to get a session token
         status, data = qumulo_request(host, "/v1/session/login", "POST", None,
                                       {"username": qu_user, "password": qu_pass})
         if status != 200:
             desc = data.get("description") or data.get("__raw") or "Authentication failed"
             return None, None, f"Qumulo auth failed: {desc}"
-        token = data.get("bearer_token") or data.get("key") or data.get("token")
-        if not token:
+        session_token = data.get("bearer_token") or data.get("key") or data.get("token")
+        if not session_token:
             return None, None, f"No token in response: {json.dumps(data)}"
-        return token, make_expiry(), None
+
+        # Step 2: exchange for a long-lived access token
+        expiry     = make_expiry()
+        at_status, at_data = qumulo_request(
+            host, "/v1/auth/access-tokens/", "POST", session_token,
+            {"user": {"domain": "LOCAL", "name": qu_user},
+             "expiration_time": expiry}
+        )
+        if at_status == 200:
+            access_token = at_data.get("bearer_token") or at_data.get("token_value") or at_data.get("token")
+            if access_token:
+                print(f"  Got long-lived access token, expires {expiry}")
+                return access_token, expiry, None
+            print(f"  Access token response had no token field: {list(at_data.keys())}")
+        else:
+            print(f"  Access token creation failed ({at_status}), falling back to session token")
+
+        # Fallback: use the session token with our standard expiry tracking
+        print(f"  Using session token (may expire sooner than {expiry})")
+        return session_token, expiry, None
 
     # ── GET ────────────────────────────────────────────────────────────
     def do_GET(self):
@@ -900,6 +928,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 val = updates["refresh_interval_seconds"]
                 if not isinstance(val, int) or val < 5 or val > 3600:
                     self.send_json(400, {"error": "refresh_interval_seconds must be between 5 and 3600"})
+                    return
+            if "token_expiry_days" in updates:
+                val = updates["token_expiry_days"]
+                if not isinstance(val, int) or val < 1 or val > 365:
+                    self.send_json(400, {"error": "token_expiry_days must be between 1 and 365"})
                     return
             app_settings.update(updates)
             save_settings(app_settings)
