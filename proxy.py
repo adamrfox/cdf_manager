@@ -277,7 +277,9 @@ def get_bearer(headers):
 # ── Token expiry helpers ───────────────────────────────────────────────
 def make_expiry():
     days = app_settings.get("token_expiry_days", QUMULO_TOKEN_EXPIRY_DAYS)
-    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    dt   = datetime.now(timezone.utc) + timedelta(days=days)
+    # Qumulo expects Z suffix format, no microseconds
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def is_expired(iso_str):
     if not iso_str:
@@ -446,23 +448,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None, None, f"No token in response: {json.dumps(data)}"
 
         # Step 2: exchange for a long-lived access token
-        expiry     = make_expiry()
-        at_status, at_data = qumulo_request(
-            host, "/v1/auth/access-tokens/", "POST", session_token,
-            {"user": {"domain": "LOCAL", "name": qu_user},
-             "expiration_time": expiry}
-        )
-        if at_status == 200:
-            access_token = at_data.get("bearer_token") or at_data.get("token_value") or at_data.get("token")
-            if access_token:
-                print(f"  Got long-lived access token, expires {expiry}")
-                return access_token, expiry, None
-            print(f"  Access token response had no token field: {list(at_data.keys())}")
-        else:
-            print(f"  Access token creation failed ({at_status}), falling back to session token")
+        expiry = make_expiry()
+        # Try LOCAL domain first, then WORLD (for AD users)
+        access_token = None
+        for domain in ("LOCAL", "WORLD"):
+            at_status, at_data = qumulo_request(
+                host, "/v1/auth/access-tokens/", "POST", session_token,
+                {"user": {"domain": domain, "name": qu_user},
+                 "expiration_time": expiry}
+            )
+            if at_status == 200:
+                access_token = at_data.get("bearer_token") or at_data.get("token_value") or at_data.get("token")
+                if access_token:
+                    print(f"  Got long-lived access token (domain={domain}), expires {expiry}")
+                    return access_token, expiry, None
+                print(f"  Access token response missing token field. Keys: {list(at_data.keys())}, data: {at_data}")
+                break
+            else:
+                desc = at_data.get("description") or at_data.get("error_class") or str(at_data)
+                print(f"  Access token failed (domain={domain}, status={at_status}): {desc}")
 
-        # Fallback: use the session token with our standard expiry tracking
-        print(f"  Using session token (may expire sooner than {expiry})")
+        # Fallback: use the session token — it will expire sooner than our tracked expiry
+        # but the user will see a 401 and be prompted to re-auth
+        print(f"  Falling back to session token (will expire before {expiry})")
         return session_token, expiry, None
 
     # ── GET ────────────────────────────────────────────────────────────
