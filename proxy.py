@@ -35,7 +35,7 @@ Endpoints:
   GET    /health                         — health check
 """
 
-import json, sys, os, ssl, uuid, hashlib, secrets, time
+import json, sys, os, ssl, uuid, hashlib, secrets, time, gzip
 import urllib.request, urllib.error, http.server
 from datetime import datetime, timedelta, timezone
 
@@ -305,7 +305,10 @@ def qumulo_request(host, path, method, token, body):
     if ":" not in host:
         host = host + ":8000"
     url     = f"https://{host}{path}"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type":    "application/json",
+        "Accept-Encoding": "identity",   # ask Qumulo not to compress responses
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -321,17 +324,31 @@ def qumulo_request(host, path, method, token, body):
 
     data = json.dumps(body).encode() if body else None
     req  = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    def decode_response(raw, resp_headers=None):
+        """Decompress if gzipped, then parse JSON."""
+        encoding = ""
+        if resp_headers:
+            encoding = resp_headers.get("Content-Encoding", "")
+        if encoding == "gzip" or (raw[:2] == b'\x1f\x8b'):
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"__raw": raw.decode(errors="replace")}
+
     try:
         with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as resp:
             raw = resp.read()
             print(f"  <-- {resp.status} OK")
-            try:    return resp.status, json.loads(raw)
-            except: return resp.status, {"__raw": raw.decode(errors="replace")}
+            return resp.status, decode_response(raw, resp.headers)
     except urllib.error.HTTPError as e:
         raw = e.read()
         print(f"  <-- {e.code} ERROR")
-        try:    err_body = json.loads(raw)
-        except: err_body = {"__raw": raw.decode(errors="replace")}
+        err_body = decode_response(raw, e.headers)
         print(f"      Response: {json.dumps(err_body)}")
         err_body["status"] = e.code
         return e.code, err_body
@@ -449,6 +466,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Step 2: exchange for a long-lived access token
         expiry = make_expiry()
+        # First, delete any existing access tokens for this user to avoid hitting the limit
+        ls_status, ls_data = qumulo_request(host, "/v1/auth/access-tokens/", "GET", session_token, None)
+        if ls_status == 200:
+            existing = ls_data if isinstance(ls_data, list) else ls_data.get("entries", [])
+            for tok in existing:
+                tok_id = tok.get("id")
+                if tok_id:
+                    d_status, _ = qumulo_request(host, f"/v1/auth/access-tokens/{tok_id}", "DELETE", session_token, None)
+                    print(f"  Deleted existing access token {tok_id} (status={d_status})")
+
         # Try LOCAL domain first, then WORLD (for AD users)
         access_token = None
         for domain in ("LOCAL", "WORLD"):
@@ -462,14 +489,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if access_token:
                     print(f"  Got long-lived access token (domain={domain}), expires {expiry}")
                     return access_token, expiry, None
-                print(f"  Access token response missing token field. Keys: {list(at_data.keys())}, data: {at_data}")
+                print(f"  Access token response missing token field. Keys: {list(at_data.keys())}")
                 break
             else:
                 desc = at_data.get("description") or at_data.get("error_class") or str(at_data)
                 print(f"  Access token failed (domain={domain}, status={at_status}): {desc}")
 
-        # Fallback: use the session token — it will expire sooner than our tracked expiry
-        # but the user will see a 401 and be prompted to re-auth
+        # Fallback: use the session token
         print(f"  Falling back to session token (will expire before {expiry})")
         return session_token, expiry, None
 
