@@ -649,6 +649,8 @@ async function doAppLogin(){
     S.role         = d.role;
     S.isAdmin      = d.is_admin||false;
     S.canPortals   = d.can_manage_portals||false;
+    // Persist session across browser refreshes
+    try{ localStorage.setItem('cdf_session', d.session_token); }catch(e){}
     document.getElementById('topbar-user').textContent  = d.username;
     document.getElementById('topbar-role').textContent  = d.role;
     document.getElementById('topbar-role').className    = 'role-badge '+d.role;
@@ -678,6 +680,7 @@ function doAppLogout(){ api('/app/logout','POST',{},true).catch(()=>{}); doForce
 function doForceLogout(){
   clearInterval(S.countdownInt);
   const wasLoggedIn = !!S.sessionToken;
+  try{ localStorage.removeItem('cdf_session'); }catch(e){}
   S = { sessionToken:null,username:null,role:null,isAdmin:false,canPortals:false,
         spokes:[],hubs:[],activeTab:'spokes',countdown:30,countdownInt:null,
         authType:null,authId:null,authExpired:false,refreshInterval:30 };
@@ -1561,8 +1564,49 @@ document.getElementById('add-spoke-host').addEventListener('keydown',e=>{ if(e.k
 document.getElementById('add-hub-host').addEventListener('keydown',e=>{ if(e.key==='Enter') doAddHub(); });
 
 // ══ INIT ═══════════════════════════════════════════════════════════════
-showScreen('screen-login');
-document.getElementById('login-username').focus();
+(async function init(){
+  // Try to restore a previous session from localStorage
+  let savedToken = null;
+  try{ savedToken = localStorage.getItem('cdf_session'); }catch(e){}
+
+  if(savedToken){
+    // Validate the saved token by calling /app/me
+    try{
+      S.sessionToken = savedToken;  // set temporarily so api() sends it
+      const me = await api('/app/me','GET',null,true);
+      // Session is still valid — restore state and go to dashboard
+      S.username   = me.username;
+      S.role       = me.role;
+      S.isAdmin    = me.is_admin||false;
+      S.canPortals = me.can_manage_portals||false;
+      document.getElementById('topbar-user').textContent  = me.username;
+      document.getElementById('topbar-role').textContent  = me.role;
+      document.getElementById('topbar-role').className    = 'role-badge '+me.role;
+      document.getElementById('btn-manage-users').style.display = S.isAdmin?'':'none';
+      document.getElementById('btn-settings').style.display     = S.isAdmin?'':'none';
+      document.getElementById('tab-hubs').style.display    = '';
+      document.getElementById('tab-portals').style.display = '';
+      if(S.isAdmin){
+        try{
+          const settings = await api('/app/settings','GET',null,true);
+          S.refreshInterval = settings.refresh_interval_seconds||30;
+        }catch(e){ S.refreshInterval=30; }
+      }
+      showScreen('screen-dashboard');
+      try{ await doRefresh(); }catch(e){ log('Initial refresh error: '+e.message,'warn'); }
+      startRefresh(S.refreshInterval);
+      return;
+    }catch(e){
+      // Session expired or invalid — clear it and show login
+      S.sessionToken = null;
+      try{ localStorage.removeItem('cdf_session'); }catch(e){}
+    }
+  }
+
+  showScreen('screen-login');
+  document.getElementById('login-username').focus();
+})();
 </script>
 </body>
 </html>
+
