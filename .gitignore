@@ -1,0 +1,5 @@
+state.json
+users.json
+sessions.json
+settings.json
+*.bak
