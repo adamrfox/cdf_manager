@@ -286,9 +286,9 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
 @keyframes spin    { to { transform: rotate(360deg); } }
 @keyframes fadeIn  { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 @keyframes slideUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
-::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
-::-webkit-scrollbar-thumb { background: var(--border-bright); }
+::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 4px; }
 .divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 </style>
 </head>
