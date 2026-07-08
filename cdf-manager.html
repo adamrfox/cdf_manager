@@ -247,6 +247,41 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
 .log-msg.info { color: var(--accent); }
 .log-msg.warn { color: var(--warn); }
 
+/* ── BROWSER ── */
+.browser-toolbar {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;
+}
+.breadcrumb {
+  display: flex; align-items: center; gap: 4px; flex: 1;
+  font-family: var(--mono); font-size: 12px; overflow: hidden;
+}
+.breadcrumb-part {
+  color: var(--accent); cursor: pointer; white-space: nowrap;
+}
+.breadcrumb-part:hover { text-decoration: underline; }
+.breadcrumb-sep { color: var(--text-dim); }
+.breadcrumb-current { color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.browser-table { width: 100%; border-collapse: collapse; }
+.browser-table th {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--accent);
+  padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border);
+  cursor: pointer; white-space: nowrap; user-select: none;
+}
+.browser-table th:hover { color: var(--text-bright); }
+.browser-table td {
+  font-family: var(--mono); font-size: 12px; color: var(--text);
+  padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: middle;
+}
+.browser-table tr:hover td { background: var(--surface2); }
+.browser-table tr.folder td { cursor: pointer; }
+.browser-table tr.folder:hover td { background: var(--surface2); }
+.file-icon  { color: var(--text-dim); margin-right: 6px; }
+.folder-icon { color: var(--accent); margin-right: 6px; }
+.cache-bar-wrap { display: flex; align-items: center; gap: 8px; min-width: 140px; }
+.cache-bar-track { flex: 1; height: 6px; background: var(--border); min-width: 80px; }
+.cache-bar-fill  { height: 100%; transition: width 0.4s ease; }
+.cache-pct { font-family: var(--mono); font-size: 11px; width: 38px; text-align: right; flex-shrink: 0; }
+
 /* ── MISC ── */
 @keyframes spin    { to { transform: rotate(360deg); } }
 @keyframes fadeIn  { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
@@ -312,6 +347,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
     <div class="tab active" id="tab-spokes"  onclick="switchTab('spokes')">SPOKES</div>
     <div class="tab"        id="tab-hubs"    onclick="switchTab('hubs')"   style="display:none">HUBS</div>
     <div class="tab"        id="tab-portals" onclick="switchTab('portals')" style="display:none">PORTALS</div>
+    <div class="tab"        id="tab-browser" onclick="switchTab('browser')">BROWSER</div>
   </div>
 
   <!-- Refresh bar -->
@@ -325,6 +361,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
   <div id="panel-spokes"  class="tab-panel cards-body"></div>
   <div id="panel-hubs"    class="tab-panel cards-body" style="display:none"></div>
   <div id="panel-portals" class="tab-panel portal-section" style="display:none"></div>
+  <div id="panel-browser"  class="tab-panel" style="display:none;padding:22px 24px"></div>
 
   <!-- Log -->
   <div class="log-panel" style="margin-top:auto">
@@ -517,6 +554,13 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
         <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">min 1 · max 365 · applied to new authentications</span>
       </div>
     </div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:2px;margin:16px 0 12px">FILE BROWSER</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <input type="checkbox" id="settings-hide-nonportal" style="width:16px;height:16px;accent-color:var(--accent)"/>
+      <label for="settings-hide-nonportal" style="font-family:var(--mono);font-size:12px;color:var(--text);cursor:pointer">
+        Hide non-portal files and folders when browsing
+      </label>
+    </div>
     <div class="error-msg" id="settings-error"></div>
     <div class="modal-actions">
       <button class="btn sm danger" onclick="closeModal('modal-settings')"><span>CANCEL</span></button>
@@ -565,7 +609,8 @@ let S = {
   hubs:            [],
   activeTab:       'spokes',
   countdown:       30,
-  refreshInterval: 30,
+  refreshInterval:    30,
+  hideNonPortal:    false,
   countdownInt:    null,
   // pending auth context
   authType:        null,   // 'spoke' | 'hub'
@@ -579,6 +624,7 @@ function fmt(b) {
   if (b >= 1099511627776) return (b/1099511627776).toFixed(2)+' TB';
   if (b >= 1073741824)    return (b/1073741824).toFixed(2)+' GB';
   if (b >= 1048576)       return (b/1048576).toFixed(1)+' MB';
+  if (b >= 1024)          return (b/1024).toFixed(1)+' KB';
   return b+' B';
 }
 function pct(a,t)  { return t ? Math.min(100, a/t*100) : 0; }
@@ -667,6 +713,7 @@ async function doAppLogin(){
       try{
         const settings = await api('/app/settings','GET',null,true);
         S.refreshInterval = settings.refresh_interval_seconds||30;
+        S.hideNonPortal   = settings.browser_hide_non_portal||false;
       }catch(e){ S.refreshInterval=30; }
     }
     try{ await doRefresh(); }catch(e){ log('Initial refresh error: '+e.message,'warn'); }
@@ -692,9 +739,11 @@ function doForceLogout(){
 // ══ TABS ═══════════════════════════════════════════════════════════════
 function switchTab(tab){
   S.activeTab = tab;
-  ['spokes','hubs','portals'].forEach(t=>{
+  if(tab==='browser') renderBrowserTab();
+  ['spokes','hubs','portals','browser'].forEach(t=>{
     document.getElementById('tab-'+t).classList.toggle('active', t===tab);
-    document.getElementById('panel-'+t).style.display = t===tab?'':'none';
+    const panel = document.getElementById('panel-'+t);
+    if(panel) panel.style.display = t===tab?'':'none';
   });
   if(tab==='portals') renderPortalsTab();
 }
@@ -908,6 +957,7 @@ function renderSpokeCard(spoke){
     +'<div class="meta-row"><div>TOKEN EXP <span>'+fmtDate(spoke.token_expires)+'</span></div></div>'
     +'</div>'
     +'<div class="cluster-card-actions">'
+    +'<button class="btn xs" data-sid="'+spoke.id+'" onclick="jumpToBrowser(this.dataset.sid)"><span>📂 BROWSE</span></button>'
     +'<button class="btn xs warn" onclick="openAuth(\'spoke\',\''+spoke.id+'\',false)"><span>🔑 RE-AUTH</span></button>'
     +(S.canPortals?'<button class="btn xs danger" onclick="doRemoveCluster(\'spoke\',\''+spoke.id+'\')"><span>REMOVE</span></button>':'')
     +'</div></div>';
@@ -1035,7 +1085,8 @@ async function renderPortalsTab(){
     +rows.map(r=>{
       const stCol = r.status==='ACTIVE'?'var(--ok)':r.status==='DEGRADED'?'var(--warn)':'var(--text-dim)';
       const delBtn = canCreate && r.spokeEntryId
-        ?'<button class="btn xs danger" onclick="doDeletePortal(\''+esc(r.spokeId)+'\',\''+esc(r.spokeEntryId)+'\')"><span>DELETE</span></button>':
+        ?'<button class="btn xs" onclick="jumpToBrowser(\''+esc(r.spokeId)+'\',\''+esc(r.spokePath)+'\')"><span>📂</span></button> '
+        +'<button class="btn xs danger" onclick="doDeletePortal(\''+esc(r.spokeId)+'\',\''+esc(r.spokeEntryId)+'\')"><span>DELETE</span></button>':
         (canCreate?'<span class="dim">—</span>':'');
       return '<tr>'
         +'<td>'+esc(r.spokeName)+'<div class="dim" style="font-size:10px">'+esc(r.spokeHost)+'</div></td>'
@@ -1459,6 +1510,7 @@ async function doSettingsOpen(){
     const d = await api('/app/settings','GET',null,true);
     document.getElementById('settings-refresh').value = d.refresh_interval_seconds||30;
     document.getElementById('settings-token-expiry').value = d.token_expiry_days||30;
+    document.getElementById('settings-hide-nonportal').checked = d.browser_hide_non_portal||false;
   }catch(e){
     document.getElementById('settings-refresh').value = S.refreshInterval||30;
   }
@@ -1467,8 +1519,9 @@ async function doSettingsOpen(){
 }
 
 async function doSaveSettings(){
-  const val      = parseInt(document.getElementById('settings-refresh').value);
-  const tokenVal = parseInt(document.getElementById('settings-token-expiry').value);
+  const val           = parseInt(document.getElementById('settings-refresh').value);
+  const tokenVal      = parseInt(document.getElementById('settings-token-expiry').value);
+  const hideNonPortal = document.getElementById('settings-hide-nonportal').checked;
   const err = document.getElementById('settings-error');
   const btn = document.getElementById('settings-submit');
   err.style.display='none';
@@ -1476,13 +1529,355 @@ async function doSaveSettings(){
   if(isNaN(tokenVal)||tokenVal<1||tokenVal>365){ showErr(err,'Token expiry must be between 1 and 365 days.'); return; }
   btn.disabled=true; btn.querySelector('span').textContent='SAVING...';
   try{
-    const d = await api('/app/settings','PATCH',{refresh_interval_seconds:val, token_expiry_days:tokenVal},true);
+    const d = await api('/app/settings','PATCH',{refresh_interval_seconds:val, token_expiry_days:tokenVal, browser_hide_non_portal:hideNonPortal},true);
     S.refreshInterval = d.refresh_interval_seconds;
+    S.hideNonPortal   = d.browser_hide_non_portal||false;
     restartRefresh(S.refreshInterval);
     log('Settings saved: refresh every '+S.refreshInterval+'s, token expiry '+d.token_expiry_days+'d','ok');
     closeModal('modal-settings');
   }catch(e){ showErr(err,e.message); }
   finally{ btn.disabled=false; btn.querySelector('span').textContent='SAVE SETTINGS'; }
+}
+
+// ══ BROWSER ════════════════════════════════════════════════════════════
+// Qumulo block size in bytes (standard is 4KB)
+const QUMULO_BLOCK_SIZE = 4096;
+
+const browserState = {
+  spokeId:    null,
+  spokeName:  '',
+  path:       '/',
+  portalRoot: null,   // the selected portal root path — files outside this are non-portal
+  sortCol:    'name',
+  sortDir:    1,   // 1=asc, -1=desc
+};
+
+function renderBrowserTab(){
+  const p = document.getElementById('panel-browser');
+  const authSpokes = S.spokes.filter(s=>s.has_token&&!s.token_expired);
+
+  // Spoke selector
+  const spokeOpts = authSpokes.map(s=>
+    '<option value="'+s.id+'"'+(s.id===browserState.spokeId?' selected':'')+'>'+esc(s.name)+' ('+esc(s.host)+')</option>'
+  ).join('');
+
+  // Portal root options for selected spoke
+  const spoke = S.spokes.find(s=>s.id===browserState.spokeId);
+  const validPortalRows = (spoke&&spoke.portalRows||[]).filter(r=>r.spokePath&&r.spokePath!=='—');
+  const portalOpts = validPortalRows.length
+    ? validPortalRows.map(r=>
+        '<option value="'+esc(r.spokePath)+'"'+
+        (r.spokePath===browserState.portalRoot?' selected':'')+'>'+
+        esc(r.spokePath)+'</option>'
+      ).join('')
+    : '<option value="/">/ (filesystem root)</option>';
+
+  // Auto-select first authenticated spoke if none selected yet
+  if(!browserState.spokeId && authSpokes.length){
+    browserState.spokeId   = authSpokes[0].id;
+    browserState.spokeName = authSpokes[0].name;
+    // Set initial portal root from first portal row
+    const firstSpoke = S.spokes.find(s=>s.id===browserState.spokeId);
+    const validRows  = (firstSpoke&&firstSpoke.portalRows||[]).filter(r=>r.spokePath&&r.spokePath!=='—');
+    if(validRows.length){
+      browserState.path       = validRows[0].spokePath;
+      browserState.portalRoot = browserState.path;
+    }
+  }
+
+  p.innerHTML =
+    '<div class="browser-toolbar">'
+    +'<div class="field" style="margin:0;min-width:220px"><label>SPOKE</label>'
+    +'<select id="browser-spoke" onchange="onBrowserSpokeChange()">'
+    +(spokeOpts||'<option value="">— No authenticated spokes —</option>')
+    +'</select></div>'
+    +'<div class="field" style="margin:0;min-width:180px"><label>PORTAL ROOT</label>'
+    +'<select id="browser-portal-root" onchange="onBrowserRootChange()">'
+    +portalOpts
+    +'</select></div>'
+    +'<button class="btn sm" onclick="browserRefresh()" style="margin-top:18px"><span>↺ REFRESH</span></button>'
+    +'</div>'
+    // Breadcrumb
+    +'<div class="breadcrumb" id="browser-breadcrumb" style="margin-bottom:14px"></div>'
+    // Content
+    +'<div id="browser-content">'
+    +(browserState.spokeId
+      ? '<div class="empty-state"><div class="spinner"></div>Loading...</div>'
+      : '<div class="empty-state">Select a spoke and portal root to start browsing.</div>')
+    +'</div>';
+
+  if(browserState.spokeId) browserLoad(browserState.path);
+}
+
+function onBrowserSpokeChange(){
+  const sel = document.getElementById('browser-spoke');
+  browserState.spokeId = sel.value;
+  const spoke = S.spokes.find(s=>s.id===browserState.spokeId);
+  browserState.spokeName = spoke?spoke.name:'';
+  // Set path to first portal root
+  const rootSel = document.getElementById('browser-portal-root');
+  browserState.path       = rootSel ? rootSel.value||'/' : '/';
+  browserState.portalRoot = browserState.path;
+  renderBrowserTab();
+}
+
+function onBrowserRootChange(){
+  const sel = document.getElementById('browser-portal-root');
+  browserState.path       = sel.value||'/';
+  browserState.portalRoot = browserState.path;
+  browserLoad(browserState.path);
+}
+
+function browserRefresh(){ browserLoad(browserState.path); }
+
+function browserNavigate(path){
+  browserState.path = path;
+  browserLoad(path);
+}
+
+// Jump here from other tabs
+function jumpToBrowser(spokeId, portalPath){
+  browserState.spokeId    = spokeId;
+  browserState.path       = portalPath||'/';
+  browserState.portalRoot = portalPath||null;
+  const spoke = S.spokes.find(s=>s.id===spokeId);
+  browserState.spokeName = spoke?spoke.name:'';
+  switchTab('browser');
+}
+
+async function browserLoad(path){
+  if(!browserState.spokeId || browserState.spokeId === 'null') return;
+  browserState.path = path;
+  const content = document.getElementById('browser-content');
+  if(!content) return;
+  content.innerHTML = '<div class="empty-state"><div class="spinner"></div>Loading...</div>';
+  renderBreadcrumb(path);
+
+  try{
+    const d = await api('/app/browse/'+browserState.spokeId+'?path='+encodeURIComponent(path),'GET',null,true);
+    renderBrowserContent(d);
+  }catch(e){
+    content.innerHTML = '<div class="empty-state" style="color:var(--danger)">Error: '+esc(e.message)+'</div>';
+  }
+}
+
+function renderBreadcrumb(path){
+  const el = document.getElementById('browser-breadcrumb');
+  if(!el) return;
+  const parts = path.split('/').filter(Boolean);
+  let html = '<span class="breadcrumb-part" data-path="/" onclick="browserNavigate(this.dataset.path)">' + esc(browserState.spokeName||'root') + '</span>';
+  let built = '';
+  parts.forEach((part, i)=>{
+    built += '/' + part;
+    html += '<span class="breadcrumb-sep"> / </span>';
+    if(i === parts.length-1){
+      html += '<span class="breadcrumb-current">'+esc(part)+'</span>';
+    } else {
+      const nav = built;
+      html += '<span class="breadcrumb-part" data-path="'+nav+'" onclick="browserNavigate(this.dataset.path)">'+esc(part)+'</span>';
+    }
+  });
+  el.innerHTML = html;
+}
+
+function cacheColor(pct){
+  if(pct === null) return 'var(--text-dim)';
+  if(pct === 0)   return 'var(--text-dim)';
+  if(pct < 50)    return 'var(--danger)';
+  if(pct < 100)   return 'var(--warn)';
+  return 'var(--ok)';
+}
+
+function renderBrowserContent(d){
+  const content = document.getElementById('browser-content');
+  if(!content) return;
+
+  const folders = d.folders||[];
+  const files   = d.files||[];
+  const attrs   = d.attributes||{};
+
+  if(!folders.length && !files.length){
+    // Even in empty dirs, show .. to navigate back
+    if(d.path && d.path !== '/'){
+      const parent = d.path.replace(/\/[^\/]+\/?$/, '') || '/';
+      content.innerHTML =
+        '<table class="browser-table"><tbody>'
+        +'<tr class="folder" data-path="'+parent+'" onclick="browserNavigate(this.dataset.path)"><td colspan="4">'
+        +'<span class="folder-icon">📁</span><span style="color:var(--text-dim)">..</span></td></tr>'
+        +'</tbody></table>'
+        +'<div style="font-family:var(--mono);font-size:12px;color:var(--text-dim);padding:12px 0">Empty directory.</div>';
+    } else {
+      content.innerHTML = '<div class="empty-state">Empty directory.</div>';
+    }
+    return;
+  }
+
+  // Sort
+  const sortedFolders = [...folders].sort((a,b)=>
+    browserState.sortDir * (a.name||'').localeCompare(b.name||''));
+  const sortedFiles = [...files].sort((a,b)=>{
+    if(browserState.sortCol==='name')
+      return browserState.sortDir * (a.name||'').localeCompare(b.name||'');
+    if(browserState.sortCol==='size'){
+      const sa = parseInt(attrs[a.id||a.name]?.size||0);
+      const sb = parseInt(attrs[b.id||b.name]?.size||0);
+      return browserState.sortDir * (sa-sb);
+    }
+    if(browserState.sortCol==='cache'){
+      const pa = getCachePct(attrs[a.id||a.name]);
+      const pb = getCachePct(attrs[b.id||b.name]);
+      return browserState.sortDir * ((pa===null?-1:pa)-(pb===null?-1:pb));
+    }
+    return 0;
+  });
+
+  function sortHeader(col, label){
+    const arrow = browserState.sortCol===col ? (browserState.sortDir===1?' ↑':' ↓') : '';
+    return '<th data-col="'+col+'" onclick="browserSort(this.dataset.col)">'+ label + arrow +'</th>';
+  }
+
+  let html = '<table class="browser-table"><thead><tr>'
+    + sortHeader('name','NAME')
+    + '<th>TYPE</th>'
+    + sortHeader('size','SIZE')
+    + sortHeader('cache','CACHED')
+    +'</tr></thead><tbody>';
+
+  // Parent directory row if not at root
+  if(d.path && d.path !== '/'){
+    const parent = d.path.replace(/\/[^\/]+\/?$/, '') || '/';
+    html += '<tr class="folder" data-path="'+parent+'" onclick="browserNavigate(this.dataset.path)"><td colspan="4">'
+      +'<span class="folder-icon">📁</span>'
+      +'<span style="color:var(--text-dim)">..</span></td></tr>';
+  }
+
+  // Determine if a path is within the selected portal root
+  // Build list of ALL portal root paths for the current spoke — not just the selected one
+  const currentSpoke   = S.spokes.find(s=>s.id===browserState.spokeId);
+  const allPortalRoots = (currentSpoke&&currentSpoke.portalRows||[])
+    .map(r=>r.spokePath)
+    .filter(p=>p&&p!=='—')
+    .map(p=>p.replace(/\/+$/,''));
+
+  function inPortal(fullPath){
+    if(!allPortalRoots.length) return true;  // no portal info — treat all as portal
+    const norm = fullPath.replace(/\/+$/,'');
+    // In portal if path is at or under ANY of the spoke's portal roots
+    return allPortalRoots.some(root=>
+      norm === root || norm.startsWith(root+'/')
+    );
+  }
+
+  // Apply hide non-portal setting
+  const visibleFolders = S.hideNonPortal
+    ? sortedFolders.filter(f=>inPortal(d.path.replace(/\/$/,'')+'/'+f.name))
+    : sortedFolders;
+  const visibleFiles = S.hideNonPortal
+    ? sortedFiles.filter(f=>inPortal(d.path.replace(/\/$/,'')+'/'+f.name))
+    : sortedFiles;
+
+  // If everything was filtered out, still show .. to navigate back
+  if(!visibleFolders.length && !visibleFiles.length){
+    const parent2 = d.path && d.path !== '/' ? (d.path.replace(/\/[^\/]+\/?$/, '') || '/') : null;
+    content.innerHTML =
+      (parent2
+        ? '<table class="browser-table"><tbody>'
+          +'<tr class="folder" data-path="'+parent2+'" onclick="browserNavigate(this.dataset.path)"><td colspan="4">'
+          +'<span class="folder-icon">📁</span><span style="color:var(--text-dim)">..</span></td></tr>'
+          +'</tbody></table>'
+        : '')
+      +'<div style="font-family:var(--mono);font-size:12px;color:var(--text-dim);padding:12px 0">'
+      +(S.hideNonPortal ? 'No portal files in this directory.' : 'Empty directory.')
+      +'</div>';
+    return;
+  }
+
+  // Folders
+  visibleFolders.forEach(f=>{
+    const fpath   = (d.path.replace(/\/$/,'')+'/'+f.name);
+    const inP     = inPortal(fpath);
+    const dimStyle = inP ? '' : 'opacity:0.5';
+    const badge    = inP ? '' : ' <span style="font-family:var(--mono);font-size:9px;color:var(--text-dim);border:1px solid var(--border);padding:1px 4px;vertical-align:middle">NON-PORTAL</span>';
+    html += '<tr class="folder" data-path="'+fpath+'" onclick="browserNavigate(this.dataset.path)" style="'+dimStyle+'"><td>'
+      +'<span class="folder-icon">📁</span>'+esc(f.name)+badge+'</td>'
+      +'<td style="color:var(--text-dim)">DIR</td>'
+      +'<td style="color:var(--text-dim)">—</td>'
+      +'<td style="color:var(--text-dim)">—</td></tr>';
+  });
+
+  // Files
+  visibleFiles.forEach(f=>{
+    const fid      = f.id||f.name;
+    const a        = attrs[fid];
+    // Handle nested attributes — Qumulo may wrap in file_attributes sub-object
+    const ad       = (a && a.file_attributes) ? a.file_attributes : a;
+    if(a && !ad.size && !ad.datablocks) console.log('Unexpected attrs for', f.name, Object.keys(a));
+    const size     = ad ? parseInt(ad.size||0) : null;
+    const pct      = getCachePct(ad);
+    const col      = cacheColor(pct);
+    const sizeStr  = size!==null ? fmt(size) : '—';
+    const pctStr   = pct!==null ? pct.toFixed(1)+'%' : '—';
+    const cachedBytes = ad ? parseInt(ad.datablocks||0) * QUMULO_BLOCK_SIZE : null;
+    const cachedStr   = cachedBytes!==null ? fmt(cachedBytes) : '—';
+    const fpath    = (d.path.replace(/\/$/,'')+'/'+f.name);
+    const inP      = inPortal(fpath);
+    const badge    = inP ? '' : ' <span style="font-family:var(--mono);font-size:9px;color:var(--text-dim);border:1px solid var(--border);padding:1px 4px;vertical-align:middle">NON-PORTAL</span>';
+    const rowStyle = inP ? '' : 'opacity:0.5';
+    // Only show cache bar for portal files — non-portal cache % is misleading
+    const showCache = inP && pct !== null;
+    html += '<tr style="'+rowStyle+'"><td><span class="file-icon">📄</span>'+esc(f.name)+badge+'</td>'
+      +'<td style="color:var(--text-dim)">FILE</td>'
+      +'<td>'+sizeStr+'</td>'
+      +'<td>'
+      +(showCache
+        ?'<div class="cache-bar-wrap">'
+          +'<div class="cache-bar-track"><div class="cache-bar-fill" style="width:'+Math.min(100,pct).toFixed(1)+'%;background:'+col+'"></div></div>'
+          +'<span class="cache-pct" style="color:'+col+'">'+pctStr+'</span>'
+          +'</div>'
+          +'<div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);margin-top:2px">'
+          +cachedStr+' / '+sizeStr+' cached'
+          +'</div>'
+        :(inP ? '—' : '<span style="color:var(--text-dim);font-size:11px">N/A</span>'))
+      +'</td></tr>';
+  });
+
+  html += '</tbody></table>';
+
+  // Summary — only count portal files for cache stats
+  const totalFiles    = visibleFiles.length;
+  const portalFiles   = visibleFiles.filter(f=>inPortal(d.path.replace(/\/$/,'')+'/'+f.name));
+  const filesWithData = portalFiles.filter(f=>attrs[f.id||f.name]);
+  const fullycached   = filesWithData.filter(f=>getCachePct(attrs[f.id||f.name])===100).length;
+  const uncached      = filesWithData.filter(f=>getCachePct(attrs[f.id||f.name])===0).length;
+  html = '<div style="display:flex;gap:20px;margin-bottom:14px;font-family:var(--mono);font-size:11px;color:var(--text-dim)">'
+    +'<span>'+folders.length+' folder'+(folders.length!==1?'s':'')+'</span>'
+    +'<span>'+totalFiles+' file'+(totalFiles!==1?'s':'')+'</span>'
+    +(filesWithData.length?'<span style="color:var(--ok)">'+fullycached+' fully cached</span>':'')
+    +(filesWithData.length?'<span style="color:var(--text-dim)">'+uncached+' uncached</span>':'')
+    +'</div>' + html;
+
+  content.innerHTML = html;
+}
+
+
+function getCachePct(a){
+  if(!a) return null;
+  const d = (a.file_attributes) ? a.file_attributes : a;
+  const logical = parseInt(d.logical_datablocks||0);
+  const data    = parseInt(d.datablocks||0);
+  if(logical === 0) return data > 0 ? 100 : 0;
+  return Math.min(100, data / logical * 100);
+}
+
+function browserSort(col){
+  if(browserState.sortCol === col){
+    browserState.sortDir *= -1;
+  } else {
+    browserState.sortCol = col;
+    browserState.sortDir = 1;
+  }
+  // Re-render with current data (re-fetch)
+  browserLoad(browserState.path);
 }
 
 // ══ CHANGE PASSWORD ═══════════════════════════════════════════════════
@@ -1609,4 +2004,3 @@ document.getElementById('add-hub-host').addEventListener('keydown',e=>{ if(e.key
 </script>
 </body>
 </html>
-

@@ -1,22 +1,43 @@
 #!/usr/bin/env python3
 """
-proxy.py — Qumulo Monitor proxy + API server
----------------------------------------------
+proxy.py — CDF Manager proxy + API server
+------------------------------------------
+Roles:
+  admin          — full access: user mgmt, role assignment, portal ops, spoke ops
+  portal_manager — hub + spoke mgmt, create/delete portal relationships
+  monitor        — spoke mgmt, view-only portal data
+
 Endpoints:
-  POST   /app/login              — log into the app
-  POST   /app/logout             — invalidate session
-  GET    /app/spokes             — list user's spokes
-  POST   /app/spokes             — add a spoke
-  DELETE /app/spokes/{id}        — remove a spoke
-  POST   /app/spokes/{id}/auth   — authenticate to a spoke cluster
-  GET    /app/users              — list users (admin only)
-  POST   /app/users              — create a user (admin only)
-  DELETE /app/users/{username}   — delete a user (admin only)
-  POST   /proxy                  — forward API call to a Qumulo cluster
-  GET    /health                 — health check
+  POST   /app/login                      — log in
+  POST   /app/logout                     — log out
+  GET    /app/me                         — current user info
+
+  GET    /app/spokes                     — list user's spokes
+  POST   /app/spokes                     — add a spoke
+  DELETE /app/spokes/{id}                — remove a spoke
+  POST   /app/spokes/{id}/auth           — authenticate spoke
+
+  GET    /app/hubs                       — list user's hubs       [portal_manager+]
+  POST   /app/hubs                       — add a hub              [portal_manager+]
+  DELETE /app/hubs/{id}                  — remove a hub           [portal_manager+]
+  POST   /app/hubs/{id}/auth             — authenticate hub       [portal_manager+]
+
+  GET    /app/portals/{spoke_id}         — list portals on a spoke
+  POST   /app/portals                    — create portal relationship [portal_manager+]
+  DELETE /app/portals/{spoke_id}/{pid}   — delete portal relationship [portal_manager+]
+
+  GET    /app/users                      — list users             [admin]
+  POST   /app/users                      — create user            [admin]
+  PATCH  /app/users/{username}           — update role            [admin]
+  DELETE /app/users/{username}           — delete user            [admin]
+
+  POST   /proxy                          — proxy Qumulo API call
+  GET    /health                         — health check
 """
 
-import json, sys, os, ssl, uuid, hashlib, secrets, urllib.request, urllib.error, http.server
+import json, sys, os, ssl, uuid, hashlib, secrets, time, gzip
+import urllib.request, urllib.error, http.server
+from urllib.parse import parse_qs, quote
 from datetime import datetime, timedelta, timezone
 
 # ── Load config ────────────────────────────────────────────────────────
@@ -29,6 +50,8 @@ try:
     QUMULO_TOKEN_EXPIRY_DAYS = config.QUMULO_TOKEN_EXPIRY_DAYS
     STATE_FILE               = config.STATE_FILE
     USERS_FILE               = config.USERS_FILE
+    SESSIONS_FILE            = getattr(config, 'SESSIONS_FILE', 'sessions.json')
+    SETTINGS_FILE            = getattr(config, 'SETTINGS_FILE', 'settings.json')
     PORT                     = config.PROXY_PORT
 except ImportError:
     print("WARNING: config.py not found, using defaults")
@@ -38,32 +61,84 @@ except ImportError:
     QUMULO_TOKEN_EXPIRY_DAYS = 30
     STATE_FILE               = "state.json"
     USERS_FILE               = "users.json"
+    SESSIONS_FILE            = "sessions.json"
+    SETTINGS_FILE            = "settings.json"
     PORT                     = 8081
+
+ROLES = ("monitor", "portal_manager")
+
+# Mutable dict — lets password changes take effect in-process without globals
+_admin = {"password_hash": ADMIN_PASSWORD_HASH}
 
 # ── SSL context ────────────────────────────────────────────────────────
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
 
-# ── Session store ──────────────────────────────────────────────────────
-sessions = {}
+# ── Sessions ───────────────────────────────────────────────────────────
+# ── Sessions ───────────────────────────────────────────────────
+def load_sessions():
+    if os.path.exists(SESSIONS_FILE):
+        try:
+            with open(SESSIONS_FILE) as f:
+                raw = json.load(f)
+            now   = datetime.now(timezone.utc)
+            valid = {k: v for k, v in raw.items()
+                     if datetime.fromisoformat(v["expires"]) > now}
+            if len(valid) < len(raw):
+                print(f"  Dropped {len(raw)-len(valid)} expired session(s) on load")
+            return valid
+        except Exception as e:
+            print(f"  WARNING: Could not load sessions: {e}")
+    return {}
+
+def save_sessions():
+    try:
+        with open(SESSIONS_FILE, "w") as f:
+            json.dump(sessions, f, indent=2)
+    except Exception as e:
+        print(f"  WARNING: Could not save sessions: {e}")
+
+sessions = load_sessions()
+
+# ── Settings persistence ───────────────────────────────────────────────
+DEFAULT_SETTINGS = {
+    "refresh_interval_seconds": 30,
+    "token_expiry_days":        30,
+    "browser_hide_non_portal":  False,
+}
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE) as f:
+                data = json.load(f)
+            # Merge with defaults so new keys are always present
+            return {**DEFAULT_SETTINGS, **data}
+        except Exception as e:
+            print(f"  WARNING: Could not load settings: {e}")
+    return dict(DEFAULT_SETTINGS)
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"  WARNING: Could not save settings: {e}")
+
+app_settings = load_settings()
 
 # ── User store ─────────────────────────────────────────────────────────
-# users.json: { "username": { "password_hash": "...", "created": "ISO" } }
-# The admin account from config.py is always injected at runtime and never written to disk.
-
 def load_users():
-    users = {}
     if os.path.exists(USERS_FILE):
         try:
             with open(USERS_FILE) as f:
-                users = json.load(f)
+                return json.load(f)
         except Exception as e:
             print(f"  WARNING: Could not load users: {e}")
-    return users
+    return {}
 
 def save_users(users):
-    # Never persist the built-in admin — it lives only in config.py
     to_save = {k: v for k, v in users.items() if k != ADMIN_USERNAME}
     try:
         with open(USERS_FILE, "w") as f:
@@ -72,21 +147,40 @@ def save_users(users):
         print(f"  WARNING: Could not save users: {e}")
 
 def get_all_users():
-    """Return combined dict of config admin + users.json accounts."""
     users = load_users()
-    users[ADMIN_USERNAME] = {"password_hash": ADMIN_PASSWORD_HASH, "created": "built-in"}
+    users[ADMIN_USERNAME] = {
+        "password_hash": _admin["password_hash"],
+        "role":          "admin",
+        "created":       "built-in",
+    }
     return users
 
 def check_password(username, password):
     hashed = hashlib.sha256(password.encode()).hexdigest()
-    users  = get_all_users()
-    u = users.get(username)
+    u = get_all_users().get(username)
     return u and u["password_hash"] == hashed
+
+def get_role(username):
+    if username == ADMIN_USERNAME:
+        return "admin"
+    u = load_users().get(username, {})
+    return u.get("role", "monitor")
 
 def is_admin(username):
     return username == ADMIN_USERNAME
 
+def can_manage_portals(username):
+    return get_role(username) in ("admin", "portal_manager")
+
 # ── State persistence ──────────────────────────────────────────────────
+# state.json structure:
+# {
+#   "username": {
+#     "spokes": { "id": { id, name, host, added, token, token_expires } },
+#     "hubs":   { "id": { id, name, host, added, token, token_expires } }
+#   }
+# }
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -105,9 +199,59 @@ def save_state(state):
 
 app_state = load_state()
 
+def normalize_hub_host(host):
+    """Strip non-API ports from hub host. Qumulo API is always on port 8000.
+    hub_port in portal data is the replication port, not the API port."""
+    if ':' in host:
+        addr, port = host.rsplit(':', 1)
+        if port == '8000':
+            return addr  # 8000 is default, no need to specify
+        # Any other port is likely the replication port — drop it
+        return addr
+    return host
+
+def dedup_hubs():
+    """Normalize hub hosts and remove duplicates on startup."""
+    changed = False
+    for username, udata in app_state.items():
+        hubs = udata.get("hubs", {})
+        # First pass: normalize all hosts (strip replication ports)
+        for hid, hub in hubs.items():
+            normalized = normalize_hub_host(hub.get("host", ""))
+            if normalized != hub.get("host", ""):
+                print(f"  Normalize hub {hid}: {hub['host']} -> {normalized} for {username}")
+                hub["host"] = normalized
+                hub["name"] = normalized  # update name too if it was the host
+                changed = True
+        # Second pass: remove duplicates by normalized host
+        seen_hosts = {}
+        to_delete = []
+        for hid, hub in hubs.items():
+            host = hub.get("host", "")
+            if host in seen_hosts:
+                existing_id = seen_hosts[host]
+                if hub.get("token") and not hubs[existing_id].get("token"):
+                    to_delete.append(existing_id)
+                    seen_hosts[host] = hid
+                else:
+                    to_delete.append(hid)
+            else:
+                seen_hosts[host] = hid
+        for hid in to_delete:
+            print(f"  Dedup: removed duplicate hub {hid} ({hubs[hid].get('host')}) for {username}")
+            del hubs[hid]
+            changed = True
+    if changed:
+        save_state(app_state)
+
+dedup_hubs()
+
 def get_user_state(username):
     if username not in app_state:
-        app_state[username] = {"spokes": {}}
+        app_state[username] = {"spokes": {}, "hubs": {}}
+    # migrate old entries that lack hubs key
+    if "hubs" not in app_state[username]:
+        app_state[username]["hubs"] = {}
     return app_state[username]
 
 # ── Session helpers ────────────────────────────────────────────────────
@@ -115,6 +259,7 @@ def create_session(username):
     token   = secrets.token_hex(32)
     expires = datetime.now(timezone.utc) + timedelta(seconds=APP_SESSION_EXPIRY)
     sessions[token] = {"username": username, "expires": expires.isoformat()}
+    save_sessions()
     return token, expires.isoformat()
 
 def validate_session(token):
@@ -123,6 +268,7 @@ def validate_session(token):
     s = sessions[token]
     if datetime.fromisoformat(s["expires"]) < datetime.now(timezone.utc):
         del sessions[token]
+        save_sessions()
         return None
     return s["username"]
 
@@ -130,12 +276,41 @@ def get_bearer(headers):
     auth = headers.get("Authorization", "")
     return auth[7:] if auth.startswith("Bearer ") else None
 
+# ── Token expiry helpers ───────────────────────────────────────────────
+def make_expiry():
+    days = app_settings.get("token_expiry_days", QUMULO_TOKEN_EXPIRY_DAYS)
+    dt   = datetime.now(timezone.utc) + timedelta(days=days)
+    # Qumulo expects Z suffix format, no microseconds
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def is_expired(iso_str):
+    if not iso_str:
+        return True
+    try:
+        return datetime.fromisoformat(iso_str) < datetime.now(timezone.utc)
+    except Exception:
+        return True
+
+def cluster_summary(cid, c):
+    return {
+        "id":            cid,
+        "name":          c.get("name", cid),
+        "host":          c.get("host", ""),
+        "added":         c.get("added", ""),
+        "has_token":     bool(c.get("token")),
+        "token_expires": c.get("token_expires"),
+        "token_expired": is_expired(c.get("token_expires")) if c.get("token") else True,
+    }
+
 # ── Qumulo API forwarding ──────────────────────────────────────────────
 def qumulo_request(host, path, method, token, body):
     if ":" not in host:
         host = host + ":8000"
     url     = f"https://{host}{path}"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type":    "application/json",
+        "Accept-Encoding": "identity",   # ask Qumulo not to compress responses
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -143,22 +318,39 @@ def qumulo_request(host, path, method, token, body):
     if token:  print(f"      Auth: Bearer {token[:12]}...")
     else:       print(f"      Auth: NONE")
     if body:
-        safe = {k: ("***" if k == "password" else v) for k, v in (body.items() if isinstance(body, dict) else {})}
-        print(f"      Body: {json.dumps(safe)}")
+        if isinstance(body, dict):
+            safe = {k: ("***" if k == "password" else v) for k, v in body.items()}
+            print(f"      Body: {json.dumps(safe)}")
+        else:
+            print(f"      Body: {json.dumps(body)}")
 
     data = json.dumps(body).encode() if body else None
     req  = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    def decode_response(raw, resp_headers=None):
+        """Decompress if gzipped, then parse JSON."""
+        encoding = ""
+        if resp_headers:
+            encoding = resp_headers.get("Content-Encoding", "")
+        if encoding == "gzip" or (raw[:2] == b'\x1f\x8b'):
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"__raw": raw.decode(errors="replace")}
+
     try:
         with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as resp:
             raw = resp.read()
             print(f"  <-- {resp.status} OK")
-            try:    return resp.status, json.loads(raw)
-            except: return resp.status, {"__raw": raw.decode(errors="replace")}
+            return resp.status, decode_response(raw, resp.headers)
     except urllib.error.HTTPError as e:
         raw = e.read()
         print(f"  <-- {e.code} ERROR")
-        try:    err_body = json.loads(raw)
-        except: err_body = {"__raw": raw.decode(errors="replace")}
+        err_body = decode_response(raw, e.headers)
         print(f"      Response: {json.dumps(err_body)}")
         err_body["status"] = e.code
         return e.code, err_body
@@ -168,6 +360,39 @@ def qumulo_request(host, path, method, token, body):
     except Exception as e:
         print(f"  <-- EXCEPTION: {e}")
         return 500, {"__proxy_error": str(e), "status": 500}
+
+def get_cluster_token(username, cluster_type, cluster_id):
+    """Retrieve stored token for a spoke or hub, checking expiry."""
+    user    = get_user_state(username)
+    store   = user["spokes"] if cluster_type == "spoke" else user["hubs"]
+    cluster = store.get(cluster_id)
+    if not cluster:
+        return None, f"{cluster_type.capitalize()} {cluster_id} not found"
+    token = cluster.get("token")
+    if not token:
+        return None, f"{cluster_type.capitalize()} has no token — authenticate first"
+    if is_expired(cluster.get("token_expires")):
+        return None, f"{cluster_type.capitalize()} token expired — re-authenticate"
+    return token, None
+
+# ── Admin password update ─────────────────────────────────────────────
+def update_admin_password_in_config(new_hash):
+    """Rewrite ADMIN_PASSWORD_HASH in config.py with the new hash."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
+    if not os.path.exists(config_path):
+        raise RuntimeError("config.py not found — cannot persist admin password change.")
+    with open(config_path, "r") as f:
+        lines = f.readlines()
+    updated = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith("ADMIN_PASSWORD_HASH"):
+            lines[i] = f'ADMIN_PASSWORD_HASH   = "{new_hash}"\n'
+            updated = True
+            break
+    if not updated:
+        raise RuntimeError("ADMIN_PASSWORD_HASH not found in config.py.")
+    with open(config_path, "w") as f:
+        f.writelines(lines)
 
 # ── HTTP Handler ───────────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -187,7 +412,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin",  "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
@@ -201,6 +426,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         token    = get_bearer(self.headers)
         username = validate_session(token)
         if not username:
+            print(f"  require_session: FAILED token={repr(token[:12]) if token else None} sessions={list(sessions.keys())[:3]}")
             self.send_json(401, {"error": "Invalid or expired session. Please log in again."})
         return username
 
@@ -211,53 +437,228 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         return username
 
+    def require_portal_manager(self):
+        username = self.require_session()
+        if username:
+            role = get_role(username)
+            can = can_manage_portals(username)
+            print(f"  require_portal_manager: user={repr(username)} role={role} can={can}")
+            if not can:
+                self.send_json(403, {"error": "Portal Manager role required."})
+                return None
+        return username
+
+    def auth_cluster(self, username, host, qu_user, qu_pass):
+        """Authenticate to a Qumulo cluster and return (token, expires, error).
+        
+        Uses /v1/session/login to get a short-lived session token, then immediately
+        exchanges it for a long-lived access token via /v1/auth/access-tokens/ with
+        an explicit expiration_time matching our QUMULO_TOKEN_EXPIRY_DAYS setting.
+        Falls back to the session token if access token creation fails.
+        """
+        # Step 1: login to get a session token
+        status, data = qumulo_request(host, "/v1/session/login", "POST", None,
+                                      {"username": qu_user, "password": qu_pass})
+        if status != 200:
+            desc = data.get("description") or data.get("__raw") or "Authentication failed"
+            return None, None, f"Qumulo auth failed: {desc}"
+        session_token = data.get("bearer_token") or data.get("key") or data.get("token")
+        if not session_token:
+            return None, None, f"No token in response: {json.dumps(data)}"
+
+        # Step 2: exchange for a long-lived access token
+        expiry = make_expiry()
+        # First, delete any existing access tokens for this user to avoid hitting the limit
+        ls_status, ls_data = qumulo_request(host, "/v1/auth/access-tokens/", "GET", session_token, None)
+        if ls_status == 200:
+            existing = ls_data if isinstance(ls_data, list) else ls_data.get("entries", [])
+            for tok in existing:
+                tok_id = tok.get("id")
+                if tok_id:
+                    d_status, _ = qumulo_request(host, f"/v1/auth/access-tokens/{tok_id}", "DELETE", session_token, None)
+                    print(f"  Deleted existing access token {tok_id} (status={d_status})")
+
+        # Try LOCAL domain first, then WORLD (for AD users)
+        access_token = None
+        for domain in ("LOCAL", "WORLD"):
+            at_status, at_data = qumulo_request(
+                host, "/v1/auth/access-tokens/", "POST", session_token,
+                {"user": {"domain": domain, "name": qu_user},
+                 "expiration_time": expiry}
+            )
+            if at_status == 200:
+                access_token = at_data.get("bearer_token") or at_data.get("token_value") or at_data.get("token")
+                if access_token:
+                    print(f"  Got long-lived access token (domain={domain}), expires {expiry}")
+                    return access_token, expiry, None
+                print(f"  Access token response missing token field. Keys: {list(at_data.keys())}")
+                break
+            else:
+                desc = at_data.get("description") or at_data.get("error_class") or str(at_data)
+                print(f"  Access token failed (domain={domain}, status={at_status}): {desc}")
+
+        # Fallback: use the session token
+        print(f"  Falling back to session token (will expire before {expiry})")
+        return session_token, expiry, None
+
     # ── GET ────────────────────────────────────────────────────────────
     def do_GET(self):
         path = self.path.split("?")[0]
 
         if path == "/health":
-            self.send_json(200, {"status": "ok"})
+            self.send_json(200, {"status": "ok", "app": "CDF Manager"})
+            return
+
+        # Current user info
+        if path == "/app/me":
+            username = self.require_session()
+            if not username: return
+            self.send_json(200, {
+                "username": username,
+                "role":     get_role(username),
+                "is_admin": is_admin(username),
+                "can_manage_portals": can_manage_portals(username),
+            })
             return
 
         # List spokes
         if path == "/app/spokes":
             username = self.require_session()
             if not username: return
-            user   = get_user_state(username)
-            spokes = []
-            now    = datetime.now(timezone.utc)
-            for sid, s in user["spokes"].items():
-                exp     = s.get("token_expires")
-                expired = True
-                if exp:
-                    try: expired = datetime.fromisoformat(exp) < now
-                    except: pass
-                spokes.append({
-                    "id":            sid,
-                    "name":          s.get("name", sid),
-                    "host":          s.get("host", ""),
-                    "added":         s.get("added", ""),
-                    "has_token":     bool(s.get("token")),
-                    "token_expires": exp,
-                    "token_expired": expired,
-                })
-            self.send_json(200, {"spokes": spokes})
+            user = get_user_state(username)
+            self.send_json(200, {"spokes": [cluster_summary(k, v) for k, v in user["spokes"].items()]})
+            return
+
+        # List hubs — visible to all roles, add/remove restricted in POST/DELETE
+        if path == "/app/hubs":
+            username = self.require_session()
+            if not username: return
+            user = get_user_state(username)
+            self.send_json(200, {"hubs": [cluster_summary(k, v) for k, v in user["hubs"].items()]})
+            return
+
+        # List portal relationships on a spoke
+        if path.startswith("/app/portals/"):
+            username = self.require_session()
+            if not username: return
+            spoke_id = path.split("/")[3]
+            user     = get_user_state(username)
+            spoke    = user["spokes"].get(spoke_id)
+            if not spoke:
+                self.send_json(404, {"error": "Spoke not found"})
+                return
+            token, err = get_cluster_token(username, "spoke", spoke_id)
+            if err:
+                self.send_json(401, {"error": err})
+                return
+            # Fetch from both portal endpoints
+            s1, spokes_data = qumulo_request(spoke["host"], "/v1/portal/spokes/",       "GET", token, None)
+            s2, fs_data     = qumulo_request(spoke["host"], "/v1/portal/file-systems/", "GET", token, None)
+            self.send_json(200, {
+                "spokes":       spokes_data if s1 < 400 else {"error": spokes_data},
+                "file_systems": fs_data     if s2 < 400 else {"error": fs_data},
+            })
             return
 
         # List users (admin only)
         if path == "/app/users":
             username = self.require_admin()
             if not username: return
-            all_users = get_all_users()
             result = []
-            for uname, udata in all_users.items():
+            for uname, udata in get_all_users().items():
                 result.append({
                     "username": uname,
+                    "role":     udata.get("role", "monitor"),
                     "created":  udata.get("created", "—"),
                     "is_admin": uname == ADMIN_USERNAME,
                     "built_in": uname == ADMIN_USERNAME,
                 })
             self.send_json(200, {"users": result})
+            return
+
+        # Get settings (admin only)
+        if path == "/app/settings":
+            username = self.require_admin()
+            if not username: return
+            self.send_json(200, app_settings)
+            return
+
+        # Browse a spoke directory
+        if path.startswith("/app/browse/"):
+            username = self.require_session()
+            if not username: return
+            # Path format: /app/browse/{spoke_id}?path=/some/path
+            parts    = path.split("/")
+            spoke_id = parts[3] if len(parts) > 3 else ""
+            qs       = parse_qs(self.path.split("?")[1] if "?" in self.path else "")
+            dir_path = qs.get("path", ["/"])[0]
+
+            user  = get_user_state(username)
+            spoke = user["spokes"].get(spoke_id)
+            if not spoke:
+                available = list(user["spokes"].keys())
+                print(f"  Browse: spoke_id={repr(spoke_id)} not found. Available: {available}")
+                self.send_json(404, {"error": f"Spoke not found (id={spoke_id})"})
+                return
+            token, err = get_cluster_token(username, "spoke", spoke_id)
+            if err:
+                self.send_json(401, {"error": err})
+                return
+
+            # List directory entries — page through all results
+            encoded_path = quote(dir_path, safe='')
+            all_entries  = []
+            next_page    = f"/v1/files/{encoded_path}/entries/"
+            page_count   = 0
+            while next_page and page_count < 50:  # safety cap at 50 pages
+                ls_status, ls_data = qumulo_request(spoke["host"], next_page, "GET", token, None)
+                if ls_status >= 400:
+                    qerr = ls_data.get("description") or ls_data.get("__raw") or str(ls_data)
+                    self.send_json(ls_status, {"error": f"Could not list directory: {qerr}"})
+                    return
+                page_entries = ls_data.get("files", ls_data.get("entries", []))
+                all_entries.extend(page_entries)
+                # Check for next page — Qumulo returns paging.next with the next URL
+                paging    = ls_data.get("paging", {})
+                next_page = paging.get("next") if paging else None
+                page_count += 1
+            print(f"  Browse: {dir_path} — {len(all_entries)} entries ({page_count} page(s))")
+
+            entries = all_entries
+
+            # Log first entry to show field names for debugging
+            if entries:
+                print(f"  Browse entry fields: {list(entries[0].keys())}")
+                print(f"  Browse first entry: {entries[0]}")
+
+            # Fetch attributes for files (not directories) to get cache info
+            # Qumulo may use 'name' or 'file_name' depending on API version
+            def entry_name(e):
+                return e.get("name") or e.get("file_name") or e.get("filename") or ""
+
+            files   = [e for e in entries if e.get("type") == "FS_FILE_TYPE_FILE"]
+            folders = [e for e in entries if e.get("type") != "FS_FILE_TYPE_FILE"]
+
+            file_attrs = {}
+            for f_entry in files:
+                f_path = f_entry.get("path") or (dir_path.rstrip("/") + "/" + entry_name(f_entry))
+                enc    = quote(f_path, safe='')
+                a_status, a_data = qumulo_request(
+                    spoke["host"], f"/v1/files/{enc}/info/attributes", "GET", token, None)
+                if a_status == 200:
+                    file_attrs[f_entry.get("id", entry_name(f_entry))] = a_data
+
+            # Normalize name field so frontend always has f.name
+            for e in folders + files:
+                if "name" not in e or not e["name"]:
+                    e["name"] = e.get("file_name") or e.get("filename") or ""
+
+            self.send_json(200, {
+                "path":       dir_path,
+                "folders":    folders,
+                "files":      files,
+                "attributes": file_attrs,
+            })
             return
 
         self.send_json(404, {"error": "Not found"})
@@ -268,7 +669,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = self.read_json()
         print(f"\n[{self.client_address[0]}] POST {path}")
 
-        # App login
+        # Login
         if path == "/app/login":
             username = payload.get("username", "")
             password = payload.get("password", "")
@@ -276,20 +677,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(401, {"error": "Invalid username or password."})
                 return
             token, expires = create_session(username)
-            print(f"  App login: {username}")
+            role = get_role(username)
+            print(f"  Login: {username} ({role})")
             self.send_json(200, {
-                "session_token": token,
-                "expires":       expires,
-                "username":      username,
-                "is_admin":      is_admin(username),
+                "session_token":      token,
+                "expires":            expires,
+                "username":           username,
+                "role":               role,
+                "is_admin":           is_admin(username),
+                "can_manage_portals": can_manage_portals(username),
             })
             return
 
-        # App logout
+        # Logout
         if path == "/app/logout":
             token = get_bearer(self.headers)
             if token and token in sessions:
                 del sessions[token]
+                save_sessions()
             self.send_json(200, {"ok": True})
             return
 
@@ -299,8 +704,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not username: return
             new_user = payload.get("username", "").strip()
             password = payload.get("password", "")
+            role     = payload.get("role", "monitor")
             if not new_user or not password:
                 self.send_json(400, {"error": "username and password are required."})
+                return
+            if role not in ROLES:
+                self.send_json(400, {"error": f"role must be one of: {', '.join(ROLES)}"})
                 return
             if new_user == ADMIN_USERNAME:
                 self.send_json(400, {"error": "Cannot create a user with the admin username."})
@@ -311,17 +720,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             users[new_user] = {
                 "password_hash": hashlib.sha256(password.encode()).hexdigest(),
+                "role":          role,
                 "created":       datetime.now(timezone.utc).isoformat(),
             }
             save_users(users)
-            print(f"  Created user: {new_user} (by {username})")
-            self.send_json(200, {"ok": True, "username": new_user})
+            print(f"  Created user: {new_user} role={role} (by {username})")
+            self.send_json(200, {"ok": True, "username": new_user, "role": role})
             return
 
-        # Add a spoke
+        # Add a spoke — portal_manager and admin only
         if path == "/app/spokes":
             username = self.require_session()
             if not username: return
+            if get_role(username) == "monitor":
+                self.send_json(403, {"error": "Monitor role cannot add spokes."})
+                return
             host = payload.get("host", "").strip()
             name = payload.get("name", "").strip() or host
             if not host:
@@ -330,19 +743,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             user = get_user_state(username)
             sid  = str(uuid.uuid4())[:8]
             user["spokes"][sid] = {
-                "id":            sid,
-                "name":          name,
-                "host":          host,
-                "added":         datetime.now(timezone.utc).isoformat(),
-                "token":         None,
-                "token_expires": None,
+                "id": sid, "name": name, "host": host,
+                "added": datetime.now(timezone.utc).isoformat(),
+                "token": None, "token_expires": None,
             }
             save_state(app_state)
             print(f"  Added spoke: {name} ({host}) for {username}")
             self.send_json(200, {"id": sid, "name": name, "host": host})
             return
 
-        # Authenticate to a spoke
+        # Authenticate a spoke
         if path.startswith("/app/spokes/") and path.endswith("/auth"):
             username = self.require_session()
             if not username: return
@@ -351,60 +761,392 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if sid not in user["spokes"]:
                 self.send_json(404, {"error": "Spoke not found"})
                 return
-            spoke   = user["spokes"][sid]
-            host    = spoke["host"]
-            qu_user = payload.get("username", "")
-            qu_pass = payload.get("password", "")
-            status, data = qumulo_request(host, "/v1/session/login", "POST", None,
-                                          {"username": qu_user, "password": qu_pass})
-            if status != 200:
-                desc = data.get("description") or data.get("__raw") or "Authentication failed"
-                self.send_json(status, {"error": f"Qumulo auth failed: {desc}"})
+            spoke = user["spokes"][sid]
+            token, expires, err = self.auth_cluster(username, spoke["host"],
+                                                    payload.get("username", ""),
+                                                    payload.get("password", ""))
+            if err:
+                self.send_json(401, {"error": err})
                 return
-            token = data.get("bearer_token") or data.get("key") or data.get("token")
-            if not token:
-                self.send_json(500, {"error": f"No token in response: {json.dumps(data)}"})
-                return
-            expires = (datetime.now(timezone.utc) + timedelta(days=QUMULO_TOKEN_EXPIRY_DAYS)).isoformat()
-            spoke["token"]         = token
-            spoke["token_expires"] = expires
+            spoke["token"] = token; spoke["token_expires"] = expires
+            # Try to fetch the cluster name
+            try:
+                sn, node_info = qumulo_request(spoke["host"], "/v1/cluster/settings", "GET", token, None)
+                if sn < 400:
+                    cluster_name = node_info.get("cluster_name") or node_info.get("name")
+                    if cluster_name and (spoke["name"] == spoke["host"] or not spoke["name"]):
+                        spoke["name"] = cluster_name
+                        print(f"  Spoke name: {cluster_name}")
+                if sn >= 400 or spoke["name"] == spoke["host"]:
+                    sn2, cluster_info = qumulo_request(spoke["host"], "/v1/cluster/", "GET", token, None)
+                    if sn2 < 400:
+                        cluster_name = cluster_info.get("cluster_name") or cluster_info.get("name")
+                        if cluster_name and (spoke["name"] == spoke["host"] or not spoke["name"]):
+                            spoke["name"] = cluster_name
+                            print(f"  Spoke name (from /v1/cluster/): {cluster_name}")
+            except Exception as e:
+                print(f"  Could not fetch spoke name: {e}")
             save_state(app_state)
-            print(f"  Spoke {sid} authenticated, token expires {expires}")
-            self.send_json(200, {"ok": True, "token_expires": expires})
+            print(f"  Spoke {sid} authenticated, expires {expires}")
+            self.send_json(200, {"ok": True, "token_expires": expires, "name": spoke.get("name", spoke["host"])})
             return
 
-        # Proxy Qumulo API call
+        # Add a hub — all roles can add hubs
+        if path == "/app/hubs":
+            username = self.require_session()
+            if not username: return
+            host = normalize_hub_host(payload.get("host", "").strip())
+            name = payload.get("name", "").strip()
+            name = normalize_hub_host(name) if name else host
+            if not host:
+                self.send_json(400, {"error": "host is required"})
+                return
+            user = get_user_state(username)
+            # Deduplicate — return existing entry if this host is already registered
+            for hid, existing in user["hubs"].items():
+                if existing.get("host") == host:
+                    print(f"  Hub already exists: {host} for {username}")
+                    self.send_json(200, {"id": hid, "name": existing["name"], "host": host})
+                    return
+            hid  = str(uuid.uuid4())[:8]
+            user["hubs"][hid] = {
+                "id": hid, "name": name, "host": host,
+                "added": datetime.now(timezone.utc).isoformat(),
+                "token": None, "token_expires": None,
+            }
+            save_state(app_state)
+            print(f"  Added hub: {name} ({host}) for {username}")
+            self.send_json(200, {"id": hid, "name": name, "host": host})
+            return
+
+        # Authenticate a hub — all roles
+        if path.startswith("/app/hubs/") and path.endswith("/auth"):
+            username = self.require_session()
+            if not username: return
+            hid  = path.split("/")[3]
+            user = get_user_state(username)
+            if hid not in user["hubs"]:
+                self.send_json(404, {"error": "Hub not found"})
+                return
+            hub = user["hubs"][hid]
+            token, expires, err = self.auth_cluster(username, hub["host"],
+                                                    payload.get("username", ""),
+                                                    payload.get("password", ""))
+            if err:
+                self.send_json(401, {"error": err})
+                return
+            hub["token"] = token; hub["token_expires"] = expires
+            # Try to fetch the cluster name from the hub
+            try:
+                sn, node_info = qumulo_request(hub["host"], "/v1/cluster/settings", "GET", token, None)
+                if sn < 400:
+                    cluster_name = node_info.get("cluster_name") or node_info.get("name")
+                    if cluster_name:
+                        hub["name"] = cluster_name
+                        print(f"  Hub name: {cluster_name}")
+                # Also try /v1/cluster/ if settings didn't have a name
+                if sn >= 400 or not hub.get("name") or hub["name"] == hub["host"]:
+                    sn2, cluster_info = qumulo_request(hub["host"], "/v1/cluster/", "GET", token, None)
+                    if sn2 < 400:
+                        cluster_name = cluster_info.get("cluster_name") or cluster_info.get("name")
+                        if cluster_name:
+                            hub["name"] = cluster_name
+                            print(f"  Hub name (from /v1/cluster/): {cluster_name}")
+            except Exception as e:
+                print(f"  Could not fetch hub name: {e}")
+            save_state(app_state)
+            print(f"  Hub {hid} authenticated, expires {expires}")
+            self.send_json(200, {"ok": True, "token_expires": expires, "name": hub.get("name", hub["host"])})
+            return
+
+        # Create a portal relationship
+        if path == "/app/portals":
+            username = self.require_portal_manager()
+            if not username: return
+
+            spoke_id             = payload.get("spoke_id", "")
+            hub_id               = payload.get("hub_id", "")
+            spoke_root           = payload.get("spoke_root", "")
+            hub_root             = payload.get("hub_root", "")
+            portal_type          = payload.get("portal_type", "PORTAL_READ_WRITE")
+            hub_replication_port = int(payload.get("hub_replication_port", 3713))
+            spoke_replication_port = int(payload.get("spoke_replication_port", 3713))
+
+            if not all([spoke_id, hub_id, spoke_root, hub_root]):
+                self.send_json(400, {"error": "spoke_id, hub_id, spoke_root, and hub_root are required."})
+                return
+
+            user = get_user_state(username)
+            spoke = user["spokes"].get(spoke_id)
+            hub   = user["hubs"].get(hub_id)
+            if not spoke: self.send_json(404, {"error": "Spoke not found"}); return
+            if not hub:   self.send_json(404, {"error": "Hub not found"});   return
+
+            spoke_token, err = get_cluster_token(username, "spoke", spoke_id)
+            if err: self.send_json(401, {"error": f"Spoke: {err}"}); return
+            hub_token, err = get_cluster_token(username, "hub", hub_id)
+            if err: self.send_json(401, {"error": f"Hub: {err}"}); return
+
+            hub_addr   = hub["host"].split(":")[0]
+            spoke_addr = spoke["host"].split(":")[0]
+
+            # ── Step 1: Create spoke entry on the spoke cluster ───────────
+            # ── Step 0: Clean up any stale PENDING entries on both clusters ────
+            # This prevents leftover entries from failed attempts blocking step 3.
+            s0s, existing_spokes = qumulo_request(spoke["host"], "/v2/portal/spokes/", "GET", spoke_token, None)
+            if s0s < 400:
+                for es in (existing_spokes.get("entries") or []):
+                    if es.get("state") in ("PENDING",) and es.get("hub_address") == hub_addr:
+                        sid_del = es.get("id")
+                        print(f"  Portal step 0: deleting stale spoke entry id={sid_del}")
+                        qumulo_request(spoke["host"], f"/v2/portal/spokes/{sid_del}", "DELETE", spoke_token, None)
+            s0h, existing_hubs = qumulo_request(hub["host"], "/v2/portal/hubs/", "GET", hub_token, None)
+            if s0h < 400:
+                for eh in (existing_hubs.get("entries") or []):
+                    if eh.get("state") in ("PENDING",) and not eh.get("spoke_hosts"):
+                        hid_del = eh.get("id")
+                        print(f"  Portal step 0: deleting stale hub entry id={hid_del}")
+                        qumulo_request(hub["host"], f"/v2/portal/hubs/{hid_del}", "DELETE", hub_token, None)
+
+            print(f"  Portal step 1: create spoke on {spoke['host']}")
+            s1, spoke_entry = qumulo_request(
+                spoke["host"], "/v2/portal/spokes/", "POST", spoke_token,
+                {"type": portal_type, "hub_hosts": [{"address": hub_addr, "port": hub_replication_port}]}
+            )
+            if s1 >= 400:
+                qerr = spoke_entry.get("description") or spoke_entry.get("error_class") or spoke_entry.get("__raw") or str(spoke_entry)
+                self.send_json(s1, {"error": f"Step 1 failed: {qerr}"})
+                return
+            spoke_entry_id = spoke_entry.get("id")
+            print(f"  Portal step 1 OK: spoke entry id={spoke_entry_id}")
+
+            # ── Step 2: Set root paths on the spoke cluster ───────────────
+            print(f"  Portal step 2: set roots spoke={spoke_root} hub={hub_root}")
+            s2, roots_result = qumulo_request(
+                spoke["host"], f"/v2/portal/spokes/{spoke_entry_id}/roots/", "POST", spoke_token,
+                {"spoke_root_path": spoke_root, "hub_root_path": hub_root}
+            )
+            if s2 >= 400:
+                qerr = roots_result.get("description") or roots_result.get("error_class") or roots_result.get("__raw") or str(roots_result)
+                self.send_json(s2, {"error": f"Step 2 failed: {qerr}"})
+                return
+            print(f"  Portal step 2 OK: roots set")
+
+            # ── Step 3: Find the pending hub entry on the hub cluster ─────
+            # Get the spoke's own cluster UUID from its cluster settings
+            # so we can correctly match against hub's spoke_cluster_uuid field.
+            s_uuid_s, spoke_cluster_info = qumulo_request(spoke["host"], "/v1/cluster/settings", "GET", spoke_token, None)
+            spoke_cluster_uuid = (spoke_cluster_info.get("cluster_id") or spoke_cluster_info.get("guid") or "") if s_uuid_s < 400 else ""
+            print(f"  Portal step 3: spoke_cluster_uuid={spoke_cluster_uuid}")
+
+            hub_entry     = None
+            hub_entry_id  = None
+            pending_roots = []
+            for attempt in range(8):
+                print(f"  Portal step 3 attempt {attempt+1}: scanning hub entries")
+                s3, hubs_list = qumulo_request(hub["host"], "/v2/portal/hubs/", "GET", hub_token, None)
+                if s3 >= 400:
+                    qerr = hubs_list.get("description") or hubs_list.get("error_class") or hubs_list.get("__raw") or str(hubs_list)
+                    self.send_json(s3, {"error": f"Step 3 failed: {qerr}"})
+                    return
+                hub_entries = hubs_list.get("entries", [])
+                print(f"  Portal step 3: hub entries: {[(e.get('id'), e.get('state'), e.get('spoke_cluster_uuid')) for e in hub_entries]}")
+                # Only match PENDING entries — skip already-accepted ones from previous attempts
+                # A PENDING entry with no spoke_hosts means it is waiting for our accept call
+                for entry in hub_entries:
+                    if entry.get("state") == "PENDING" and not entry.get("spoke_hosts"):
+                        if spoke_cluster_uuid and entry.get("spoke_cluster_uuid") == spoke_cluster_uuid:
+                            hub_entry = entry
+                            break
+                        elif not spoke_cluster_uuid:
+                            hub_entry = entry
+                            break
+                if hub_entry:
+                    break
+                if attempt < 7:
+                    print(f"  Portal step 3: no match yet, waiting 2s...")
+                    time.sleep(2)
+            if not hub_entry:
+                self.send_json(500, {"error": f"Step 3 failed: no matching hub entry found (spoke_uuid={spoke_cluster_uuid})", "hub_entries": hubs_list.get("entries", [])})
+                return
+            hub_entry_id  = hub_entry.get("id")
+            pending_roots = hub_entry.get("pending_roots", [])
+            print(f"  Portal step 3 OK: hub entry id={hub_entry_id} state={hub_entry.get('state')} pending_roots={pending_roots}")
+
+
+            # ── Step 4: Accept the spoke on the hub and authorize all pending roots ──
+            # Pass pending_roots as authorized_roots — equivalent to portal_accept_hub -A
+            # This both accepts the spoke and grants data access in one call.
+            print(f"  Portal step 4: accept spoke on hub with authorized_roots={pending_roots}")
+            s4, accept_result = qumulo_request(
+                hub["host"], f"/v2/portal/hubs/{hub_entry_id}/accept", "POST", hub_token,
+                {"spoke_hosts": [{"address": spoke_addr, "port": spoke_replication_port}],
+                 "authorized_roots": pending_roots}
+            )
+            if s4 >= 400:
+                qerr = accept_result.get("description") or accept_result.get("error_class") or accept_result.get("__raw") or str(accept_result)
+                self.send_json(s4, {"error": f"Step 4 failed: {qerr}"})
+                return
+            print(f"  Portal step 4 OK: state={accept_result.get('state')} status={accept_result.get('status')} authorized_roots={accept_result.get('authorized_roots')}")
+
+            print(f"  Portal created: spoke {spoke_id} ({spoke_addr}) -> hub {hub_id} ({hub_addr})")
+            self.send_json(200, {"ok": True, "spoke_entry": spoke_entry, "hub_entry": accept_result})
+            return
+
+
+        # Proxy a Qumulo API call
         if path == "/proxy":
             username = self.require_session()
             if not username: return
-            host     = payload.get("host", "")
-            api_path = payload.get("path", "")
-            method   = payload.get("method", "GET").upper()
-            token    = payload.get("token", "")
-            spoke_id = payload.get("spoke_id", "")
-            body     = payload.get("body", None)
+            host         = payload.get("host", "")
+            api_path     = payload.get("path", "")
+            method       = payload.get("method", "GET").upper()
+            spoke_id     = payload.get("spoke_id", "")
+            hub_id       = payload.get("hub_id", "")
+            body         = payload.get("body", None)
+            token        = payload.get("token", "")
+
             if not host or not api_path:
                 self.send_json(400, {"__proxy_error": "Missing host or path"})
                 return
+
             if spoke_id:
-                user  = get_user_state(username)
-                spoke = user["spokes"].get(spoke_id)
-                if not spoke:
-                    self.send_json(404, {"__proxy_error": f"Spoke {spoke_id} not found"})
-                    return
-                token = spoke.get("token") or ""
-                if not token:
-                    self.send_json(401, {"__proxy_error": "Spoke has no token — authenticate first"})
-                    return
-                exp = spoke.get("token_expires")
-                if exp:
-                    try:
-                        if datetime.fromisoformat(exp) < datetime.now(timezone.utc):
-                            self.send_json(401, {"__proxy_error": "Spoke token expired — re-authenticate"})
-                            return
-                    except: pass
+                token, err = get_cluster_token(username, "spoke", spoke_id)
+                if err: self.send_json(401, {"__proxy_error": err}); return
+            elif hub_id:
+                token, err = get_cluster_token(username, "hub", hub_id)
+                if err: self.send_json(401, {"__proxy_error": err}); return
+
             status, result = qumulo_request(host, api_path, method, token, body)
             self.send_json(200 if status < 400 else status, result)
+            return
+
+        self.send_json(404, {"error": "Not found"})
+
+    # ── PATCH ──────────────────────────────────────────────────────────
+    def do_PATCH(self):
+        path    = self.path.split("?")[0]
+        payload = self.read_json()
+        print(f"\n[{self.client_address[0]}] PATCH {path}")
+
+        # Update settings (admin only)
+        if path == "/app/settings":
+            admin = self.require_admin()
+            if not admin: return
+            allowed = set(DEFAULT_SETTINGS.keys())
+            updates = {k: v for k, v in payload.items() if k in allowed}
+            if not updates:
+                self.send_json(400, {"error": f"Valid settings keys: {', '.join(allowed)}"})
+                return
+            if "refresh_interval_seconds" in updates:
+                val = updates["refresh_interval_seconds"]
+                if not isinstance(val, int) or val < 5 or val > 3600:
+                    self.send_json(400, {"error": "refresh_interval_seconds must be between 5 and 3600"})
+                    return
+            if "token_expiry_days" in updates:
+                val = updates["token_expiry_days"]
+                if not isinstance(val, int) or val < 1 or val > 365:
+                    self.send_json(400, {"error": "token_expiry_days must be between 1 and 365"})
+                    return
+            if "browser_hide_non_portal" in updates:
+                if not isinstance(updates["browser_hide_non_portal"], bool):
+                    self.send_json(400, {"error": "browser_hide_non_portal must be true or false"})
+                    return
+            app_settings.update(updates)
+            save_settings(app_settings)
+            print(f"  Settings updated by {admin}: {updates}")
+            self.send_json(200, app_settings)
+            return
+
+        # Change own password
+        if path == "/app/me/password":
+            username = self.require_session()
+            if not username: return
+            old_pw  = payload.get("old_password", "")
+            new_pw  = payload.get("new_password", "")
+            if not old_pw or not new_pw:
+                self.send_json(400, {"error": "old_password and new_password are required."})
+                return
+            if len(new_pw) < 6:
+                self.send_json(400, {"error": "Password must be at least 6 characters."})
+                return
+            if not check_password(username, old_pw):
+                self.send_json(401, {"error": "Current password is incorrect."})
+                return
+            # Admin password is stored in config.py — rewrite it there
+            if username == ADMIN_USERNAME:
+                try:
+                    new_hash = hashlib.sha256(new_pw.encode()).hexdigest()
+                    update_admin_password_in_config(new_hash)
+                    # Update the module-level variable so running process reflects change
+                    _admin["password_hash"] = new_hash
+                    print(f"  Admin password updated in config.py")
+                    self.send_json(200, {"ok": True})
+                except Exception as e:
+                    self.send_json(500, {"error": f"Could not update config.py: {e}"})
+                return
+            users = load_users()
+            if username not in users:
+                self.send_json(404, {"error": "User not found."})
+                return
+            users[username]["password_hash"] = hashlib.sha256(new_pw.encode()).hexdigest()
+            save_users(users)
+            print(f"  Password changed: {username}")
+            self.send_json(200, {"ok": True})
+            return
+
+        # Update user role or password (admin only)
+        if path.startswith("/app/users/"):
+            admin = self.require_admin()
+            if not admin: return
+            target  = path.split("/")[3]
+            new_role = payload.get("role", "")
+            new_pw   = payload.get("password", "")
+
+            # Role change
+            if new_role:
+                if target == ADMIN_USERNAME:
+                    self.send_json(400, {"error": "Cannot change the built-in admin's role."})
+                    return
+                if new_role not in ROLES:
+                    self.send_json(400, {"error": f"role must be one of: {', '.join(ROLES)}"})
+                    return
+                users = load_users()
+                if target not in users:
+                    self.send_json(404, {"error": f"User '{target}' not found."})
+                    return
+                users[target]["role"] = new_role
+                save_users(users)
+                print(f"  Updated {target} role -> {new_role} (by {admin})")
+                self.send_json(200, {"ok": True, "username": target, "role": new_role})
+                return
+
+            # Password change by admin
+            if new_pw:
+                if len(new_pw) < 6:
+                    self.send_json(400, {"error": "Password must be at least 6 characters."})
+                    return
+                if target == ADMIN_USERNAME:
+                    try:
+                        new_hash = hashlib.sha256(new_pw.encode()).hexdigest()
+                        update_admin_password_in_config(new_hash)
+                        _admin["password_hash"] = new_hash
+                        print(f"  Admin password updated in config.py (by {admin})")
+                        self.send_json(200, {"ok": True})
+                    except Exception as e:
+                        self.send_json(500, {"error": f"Could not update config.py: {e}"})
+                    return
+                users = load_users()
+                if target not in users:
+                    self.send_json(404, {"error": f"User '{target}' not found."})
+                    return
+                users[target]["password_hash"] = hashlib.sha256(new_pw.encode()).hexdigest()
+                save_users(users)
+                print(f"  Password changed for {target} (by {admin})")
+                self.send_json(200, {"ok": True})
+                return
+
+            self.send_json(400, {"error": "Provide role or password to update."})
             return
 
         self.send_json(404, {"error": "Not found"})
@@ -414,10 +1156,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         print(f"\n[{self.client_address[0]}] DELETE {path}")
 
-        # Delete a spoke
+        # Delete spoke — portal_manager and admin only
         if path.startswith("/app/spokes/"):
             username = self.require_session()
             if not username: return
+            if get_role(username) == "monitor":
+                self.send_json(403, {"error": "Monitor role cannot remove spokes."})
+                return
             sid  = path.split("/")[3]
             user = get_user_state(username)
             if sid not in user["spokes"]:
@@ -430,7 +1175,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True})
             return
 
-        # Delete a user (admin only)
+        # Delete hub — all roles
+        if path.startswith("/app/hubs/"):
+            username = self.require_session()
+            if not username: return
+            hid  = path.split("/")[3]
+            user = get_user_state(username)
+            if hid not in user["hubs"]:
+                self.send_json(404, {"error": "Hub not found"})
+                return
+            name = user["hubs"][hid].get("name", hid)
+            del user["hubs"][hid]
+            save_state(app_state)
+            print(f"  Removed hub {hid} ({name}) for {username}")
+            self.send_json(200, {"ok": True})
+            return
+
+        # Delete a portal relationship
+        if path.startswith("/app/portals/"):
+            username = self.require_portal_manager()
+            if not username: return
+            parts    = path.split("/")   # ['', 'app', 'portals', spoke_id, portal_id]
+            if len(parts) < 5:
+                self.send_json(400, {"error": "Usage: DELETE /app/portals/{spoke_id}/{portal_id}"}); return
+            spoke_id  = parts[3]
+            portal_id = parts[4]
+            user  = get_user_state(username)
+            spoke = user["spokes"].get(spoke_id)
+            if not spoke: self.send_json(404, {"error": "Spoke not found"}); return
+            token, err = get_cluster_token(username, "spoke", spoke_id)
+            if err: self.send_json(401, {"error": err}); return
+            status, result = qumulo_request(spoke["host"],
+                                            f"/v2/portal/spokes/{portal_id}",
+                                            "DELETE", token, None)
+            if status >= 400:
+                self.send_json(status, {"error": "Failed to delete portal", "detail": result})
+                return
+            print(f"  Portal {portal_id} deleted from spoke {spoke_id}")
+            self.send_json(200, {"ok": True})
+            return
+
+        # Delete user (admin only)
         if path.startswith("/app/users/"):
             admin = self.require_admin()
             if not admin: return
@@ -444,7 +1229,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             del users[target]
             save_users(users)
-            # Also remove their spoke state
             if target in app_state:
                 del app_state[target]
                 save_state(app_state)
@@ -469,14 +1253,14 @@ def run():
 
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"""
-  ╔═══════════════════════════════════════════════╗
-  ║   Qumulo Monitor Proxy  —  port {PORT}           ║
-  ║   Admin account    : {ADMIN_USERNAME:<22} ║
-  ║   SSL verification : DISABLED                ║
-  ║   State file       : {STATE_FILE:<22} ║
-  ║   Users file       : {USERS_FILE:<22} ║
-  ║   Press Ctrl-C to stop                       ║
-  ╚═══════════════════════════════════════════════╝
+  ╔══════════════════════════════════════════════════╗
+  ║   CDF Manager Proxy  —  port {PORT}                ║
+  ║   Admin account    : {ADMIN_USERNAME:<25} ║
+  ║   SSL verification : DISABLED                   ║
+  ║   State file       : {STATE_FILE:<25} ║
+  ║   Users file       : {USERS_FILE:<25} ║
+  ║   Press Ctrl-C to stop                          ║
+  ╚══════════════════════════════════════════════════╝
 """)
     try:
         server.serve_forever()
