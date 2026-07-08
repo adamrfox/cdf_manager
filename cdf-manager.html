@@ -1863,13 +1863,14 @@ function renderBrowserContent(d){
 function getCachePct(a){
   if(!a) return null;
   const d = (a.file_attributes) ? a.file_attributes : a;
-  const logical = parseInt(d.logical_datablocks||0);
   const data    = parseInt(d.datablocks||0);
+  let   logical = parseInt(d.logical_datablocks||0);
+  // If logical_datablocks not set, derive from file size / block size
+  if(logical === 0 && d.size) logical = Math.ceil(parseInt(d.size) / 4096);
   if(logical === 0) return data > 0 ? 100 : 0;
   return Math.min(100, data / logical * 100);
-}
-
 function browserSort(col){
+}
   if(browserState.sortCol === col){
     browserState.sortDir *= -1;
   } else {
