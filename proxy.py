@@ -326,6 +326,7 @@ def qumulo_request(host, path, method, token, body):
 
     data = json.dumps(body).encode() if body else None
     req  = urllib.request.Request(url, data=data, headers=headers, method=method)
+    timeout = 5 if path.endswith('/info/attributes') else 15  # faster timeout for attr calls
 
     def decode_response(raw, resp_headers=None):
         """Decompress if gzipped, then parse JSON."""
@@ -343,7 +344,7 @@ def qumulo_request(host, path, method, token, body):
             return {"__raw": raw.decode(errors="replace")}
 
     try:
-        with urllib.request.urlopen(req, context=SSL_CTX, timeout=15) as resp:
+        with urllib.request.urlopen(req, context=SSL_CTX, timeout=timeout) as resp:
             raw = resp.read()
             print(f"  <-- {resp.status} OK")
             return resp.status, decode_response(raw, resp.headers)
@@ -605,12 +606,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(401, {"error": err})
                 return
 
-            # List directory entries — page through all results
+            # List directory entries — page through all results with larger page size
             encoded_path = quote(dir_path, safe='')
             all_entries  = []
-            next_page    = f"/v1/files/{encoded_path}/entries/"
+            # Request 1000 entries per page to minimize round trips
+            first_page   = f"/v1/files/{encoded_path}/entries/?limit=1000"
+            next_page    = first_page
             page_count   = 0
-            while next_page and page_count < 50:  # safety cap at 50 pages
+            while next_page and page_count < 20:  # safety cap
                 ls_status, ls_data = qumulo_request(spoke["host"], next_page, "GET", token, None)
                 if ls_status >= 400:
                     qerr = ls_data.get("description") or ls_data.get("__raw") or str(ls_data)
@@ -639,25 +642,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
             files   = [e for e in entries if e.get("type") == "FS_FILE_TYPE_FILE"]
             folders = [e for e in entries if e.get("type") != "FS_FILE_TYPE_FILE"]
 
-            file_attrs = {}
-            for f_entry in files:
+            # Pagination — get page/page_size from query string
+            page_size = int(qs.get("page_size", ["100"])[0])
+            page_num  = int(qs.get("page",      ["1"])[0])
+            page_size = max(10, min(500, page_size))  # clamp 10-500
+            page_num  = max(1, page_num)
+
+            total_files   = len(files)
+            total_folders = len(folders)
+            total_pages   = max(1, -(-total_files // page_size))  # ceiling division
+            page_num      = min(page_num, total_pages)
+
+            file_offset   = (page_num - 1) * page_size
+            files_page    = files[file_offset : file_offset + page_size]
+
+            print(f"  Browse: page {page_num}/{total_pages}, showing {len(files_page)} of {total_files} files")
+
+            # Fetch attributes only for current page's files
+            import concurrent.futures
+            file_attrs   = {}
+            ATTR_WORKERS = 32
+
+            def fetch_attr(f_entry):
                 f_path = f_entry.get("path") or (dir_path.rstrip("/") + "/" + entry_name(f_entry))
                 enc    = quote(f_path, safe='')
                 a_status, a_data = qumulo_request(
                     spoke["host"], f"/v1/files/{enc}/info/attributes", "GET", token, None)
                 if a_status == 200:
-                    file_attrs[f_entry.get("id", entry_name(f_entry))] = a_data
+                    return f_entry.get("id", entry_name(f_entry)), a_data
+                return None, None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=ATTR_WORKERS) as executor:
+                results = executor.map(fetch_attr, files_page)
+                for key, val in results:
+                    if key is not None:
+                        file_attrs[key] = val
+
+            print(f"  Browse: fetched attrs for {len(file_attrs)}/{len(files_page)} files")
 
             # Normalize name field so frontend always has f.name
-            for e in folders + files:
+            for e in folders + files_page:
                 if "name" not in e or not e["name"]:
                     e["name"] = e.get("file_name") or e.get("filename") or ""
 
             self.send_json(200, {
-                "path":       dir_path,
-                "folders":    folders,
-                "files":      files,
-                "attributes": file_attrs,
+                "path":         dir_path,
+                "folders":      folders,   # always show all folders
+                "files":        files_page,
+                "attributes":   file_attrs,
+                "pagination": {
+                    "page":        page_num,
+                    "page_size":   page_size,
+                    "total_files": total_files,
+                    "total_pages": total_pages,
+                },
             })
             return
 

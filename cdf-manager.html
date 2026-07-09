@@ -1550,8 +1550,12 @@ const browserState = {
   portalRoot: null,   // the selected portal root path — files outside this are non-portal
   sortCol:    'name',
   sortDir:    1,   // 1=asc, -1=desc
+  lastData:   null,
+  page:       1,
+  pageSize:   100,
+  filter:     '',
+  filterRegex: false,
 };
-
 function renderBrowserTab(){
   const p = document.getElementById('panel-browser');
   const authSpokes = S.spokes.filter(s=>s.has_token&&!s.token_expired);
@@ -1595,6 +1599,13 @@ function renderBrowserTab(){
     +'<select id="browser-portal-root" onchange="onBrowserRootChange()">'
     +portalOpts
     +'</select></div>'
+    +'<div class="field" style="margin:0;min-width:260px"><label>FILTER</label>'
+    +'<div style="display:flex;gap:6px;align-items:center">'
+    +'<input type="text" id="browser-filter" placeholder="filename or /regex/" value="'+esc(browserState.filter)+'"'
+    +' oninput="browserFilterChange(this.value)" style="flex:1"/>'
+    +'<label style="display:flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10px;color:var(--text-dim);cursor:pointer;white-space:nowrap">'
+    +'<input type="checkbox" id="browser-regex" '+(browserState.filterRegex?'checked':'')+' onchange="browserFilterRegexToggle(this.checked)" style="accent-color:var(--accent)"/> REGEX'
+    +'</label></div></div>'
     +'<button class="btn sm" onclick="browserRefresh()" style="margin-top:18px"><span>↺ REFRESH</span></button>'
     +'</div>'
     // Breadcrumb
@@ -1631,7 +1642,9 @@ function onBrowserRootChange(){
 function browserRefresh(){ browserLoad(browserState.path); }
 
 function browserNavigate(path){
-  browserState.path = path;
+  browserState.path   = path;
+  browserState.page   = 1;
+  browserState.filter = '';
   browserLoad(path);
 }
 
@@ -1654,7 +1667,8 @@ async function browserLoad(path){
   renderBreadcrumb(path);
 
   try{
-    const d = await api('/app/browse/'+browserState.spokeId+'?path='+encodeURIComponent(path),'GET',null,true);
+    const pageParams = '&page='+browserState.page+'&page_size='+browserState.pageSize;
+    const d = await api('/app/browse/'+browserState.spokeId+'?path='+encodeURIComponent(path)+pageParams,'GET',null,true);
     renderBrowserContent(d);
   }catch(e){
     content.innerHTML = '<div class="empty-state" style="color:var(--danger)">Error: '+esc(e.message)+'</div>';
@@ -1712,10 +1726,35 @@ function renderBrowserContent(d){
     return;
   }
 
+  // Apply filename filter
+  const filterStr = browserState.filter.trim();
+  let filteredFiles = files;
+  let filteredFolders = folders;
+  if(filterStr){
+    let testFn;
+    // Check if it's a /regex/ pattern
+    const regexMatch = filterStr.match(/^\/(.+)\/([gimsuy]*)$/);
+    if(regexMatch || browserState.filterRegex){
+      try{
+        const rx = regexMatch
+          ? new RegExp(regexMatch[1], regexMatch[2])
+          : new RegExp(filterStr, 'i');
+        testFn = name => rx.test(name);
+      }catch(e){
+        // Invalid regex — fall back to plain text
+        testFn = name => name.toLowerCase().includes(filterStr.toLowerCase());
+      }
+    } else {
+      testFn = name => name.toLowerCase().includes(filterStr.toLowerCase());
+    }
+    filteredFiles   = files.filter(f   => testFn(f.name||''));
+    filteredFolders = folders.filter(f => testFn(f.name||''));
+  }
+
   // Sort
-  const sortedFolders = [...folders].sort((a,b)=>
+  const sortedFolders = [...filteredFolders].sort((a,b)=>
     browserState.sortDir * (a.name||'').localeCompare(b.name||''));
-  const sortedFiles = [...files].sort((a,b)=>{
+  const sortedFiles = [...filteredFiles].sort((a,b)=>{
     if(browserState.sortCol==='name')
       return browserState.sortDir * (a.name||'').localeCompare(b.name||'');
     if(browserState.sortCol==='size'){
@@ -1775,6 +1814,7 @@ function renderBrowserContent(d){
   const visibleFiles = S.hideNonPortal
     ? sortedFiles.filter(f=>inPortal(d.path.replace(/\/$/,'')+'/'+f.name))
     : sortedFiles;
+  const filterActive = filterStr.length > 0;
 
   // If everything was filtered out, still show .. to navigate back
   if(!visibleFolders.length && !visibleFiles.length){
@@ -1848,12 +1888,43 @@ function renderBrowserContent(d){
   const portalFiles   = visibleFiles.filter(f=>inPortal(d.path.replace(/\/$/,'')+'/'+f.name));
   const filesWithData = portalFiles.filter(f=>attrs[f.id||f.name]);
   const fullycached   = filesWithData.filter(f=>getCachePct(attrs[f.id||f.name])===100).length;
-  const uncached      = filesWithData.filter(f=>getCachePct(attrs[f.id||f.name])===0).length;
-  html = '<div style="display:flex;gap:20px;margin-bottom:14px;font-family:var(--mono);font-size:11px;color:var(--text-dim)">'
+  const uncached      = filesWithData.filter(f=>{
+    const p = getCachePct(attrs[f.id||f.name]);
+    return p !== null && p === 0;
+  }).length;
+  const attrLimit = browserState.pageSize;
+  const limitedAttrs = false;
+  const pg       = d.pagination || {};
+  const curPage  = pg.page || 1;
+  const totPages = pg.total_pages || 1;
+  const totFiles = pg.total_files || totalFiles;
+  const prevBtn  = curPage > 1
+    ? '<button class="btn xs" data-pg="'+(curPage-1)+'" onclick="browserPage(+this.dataset.pg)"><span>← PREV</span></button>'
+    : '<button class="btn xs" disabled style="opacity:0.3"><span>← PREV</span></button>';
+  const nextBtn  = curPage < totPages
+    ? '<button class="btn xs" data-pg="'+(curPage+1)+'" onclick="browserPage(+this.dataset.pg)"><span>NEXT →</span></button>'
+    : '<button class="btn xs" disabled style="opacity:0.3"><span>NEXT →</span></button>';
+
+  html = '<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;flex-wrap:wrap">'
+    +'<div style="display:flex;gap:16px;font-family:var(--mono);font-size:11px;color:var(--text-dim);flex:1;flex-wrap:wrap">'
     +'<span>'+folders.length+' folder'+(folders.length!==1?'s':'')+'</span>'
-    +'<span>'+totalFiles+' file'+(totalFiles!==1?'s':'')+'</span>'
+    +'<span>'+totFiles+' file'+(totFiles!==1?'s':'')+'</span>'
     +(filesWithData.length?'<span style="color:var(--ok)">'+fullycached+' fully cached</span>':'')
     +(filesWithData.length?'<span style="color:var(--text-dim)">'+uncached+' uncached</span>':'')
+    +(filterActive?'<span style="color:var(--accent)">⌕ filtered: '+visibleFiles.length+' match'+(visibleFiles.length!==1?'es':'')+'</span>':'')
+    +'</div>'
+    +(totPages>1
+      ?'<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'
+        +prevBtn
+        +'<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">'+curPage+' / '+totPages+'</span>'
+        +nextBtn
+        +'<select onchange="browserPageSize(this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:11px;padding:3px 6px">'
+        +'<option value="50"'+(browserState.pageSize===50?' selected':'')+'>50/page</option>'
+        +'<option value="100"'+(browserState.pageSize===100?' selected':'')+'>100/page</option>'
+        +'<option value="250"'+(browserState.pageSize===250?' selected':'')+'>250/page</option>'
+        +'<option value="500"'+(browserState.pageSize===500?' selected':'')+'>500/page</option>'
+        +'</select></div>'
+      :'')
     +'</div>' + html;
 
   content.innerHTML = html;
@@ -1869,16 +1940,40 @@ function getCachePct(a){
   if(logical === 0 && d.size) logical = Math.ceil(parseInt(d.size) / 4096);
   if(logical === 0) return data > 0 ? 100 : 0;
   return Math.min(100, data / logical * 100);
-function browserSort(col){
 }
+function browserSort(col){
   if(browserState.sortCol === col){
     browserState.sortDir *= -1;
   } else {
     browserState.sortCol = col;
     browserState.sortDir = 1;
   }
-  // Re-render with current data (re-fetch)
+  if(browserState.lastData){
+    renderBrowserContent(browserState.lastData);
+  } else {
+    browserLoad(browserState.path);
+  }
+}
+// ══ BROWSER PAGINATION ════════════════════════════════════════════════
+function browserPage(page){
+  browserState.page = page;
   browserLoad(browserState.path);
+}
+function browserPageSize(size){
+  browserState.pageSize = parseInt(size);
+  browserState.page     = 1;
+  browserLoad(browserState.path);
+}
+
+function browserFilterChange(val){
+  browserState.filter = val;
+  browserState.page   = 1;
+  if(browserState.lastData) renderBrowserContent(browserState.lastData);
+}
+
+function browserFilterRegexToggle(checked){
+  browserState.filterRegex = checked;
+  if(browserState.lastData) renderBrowserContent(browserState.lastData);
 }
 
 // ══ CHANGE PASSWORD ═══════════════════════════════════════════════════
