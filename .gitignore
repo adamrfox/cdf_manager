@@ -3,3 +3,4 @@ users.json
 sessions.json
 settings.json
 *.bak
+__pycache__/

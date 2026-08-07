@@ -31,12 +31,18 @@ Endpoints:
   PATCH  /app/users/{username}           — update role            [admin]
   DELETE /app/users/{username}           — delete user            [admin]
 
+  GET    /app/browse/{spoke_id}          — browse spoke filesystem
+  POST   /app/evict/preview              — count files an eviction would affect [portal_manager+]
+  POST   /app/evict                      — start a cache eviction job [portal_manager+]
+  GET    /app/evict/{job_id}             — poll eviction job status [portal_manager+]
+
   POST   /proxy                          — proxy Qumulo API call
   GET    /health                         — health check
 """
 
-import json, sys, os, ssl, uuid, hashlib, secrets, time, gzip
+import json, sys, os, ssl, uuid, hashlib, secrets, time, gzip, threading
 import urllib.request, urllib.error, http.server
+import concurrent.futures
 from urllib.parse import parse_qs, quote
 from datetime import datetime, timedelta, timezone
 
@@ -100,6 +106,21 @@ def save_sessions():
         print(f"  WARNING: Could not save sessions: {e}")
 
 sessions = load_sessions()
+
+# ── Cache eviction jobs ──────────────────────────────────────────────────
+# In-memory only — jobs are short-lived and don't need to survive a restart.
+# { job_id: { status: "walking"|"evicting"|"done", total, completed,
+#             evicted_blocks, errors: [{path, error}], started_at } }
+evict_jobs      = {}
+evict_jobs_lock = threading.Lock()
+EVICT_JOB_TTL   = 3600   # seconds — sweep jobs older than this on each request
+EVICT_WORKERS   = 32     # matches ATTR_WORKERS in the browse endpoint
+
+def sweep_evict_jobs():
+    now = time.time()
+    stale = [jid for jid, j in evict_jobs.items() if now - j["started_at"] > EVICT_JOB_TTL]
+    for jid in stale:
+        del evict_jobs[jid]
 
 # ── Settings persistence ───────────────────────────────────────────────
 DEFAULT_SETTINGS = {
@@ -376,6 +397,117 @@ def get_cluster_token(username, cluster_type, cluster_id):
         return None, f"{cluster_type.capitalize()} token expired — re-authenticate"
     return token, None
 
+# ── Recursive file walk (for cache eviction) ────────────────────────────
+def entry_name(e):
+    """Qumulo may use 'name' or 'file_name' depending on API version."""
+    return e.get("name") or e.get("file_name") or e.get("filename") or ""
+
+def list_dir_entries(host, token, dir_path):
+    """Page through a single directory's entries via the Qumulo API.
+    Returns the raw entry list, or None (with an error printed) on failure."""
+    encoded_path = quote(dir_path, safe='')
+    all_entries  = []
+    next_page    = f"/v1/files/{encoded_path}/entries/?limit=1000"
+    page_count   = 0
+    while next_page and page_count < 20:  # safety cap, matches browse endpoint
+        status, data = qumulo_request(host, next_page, "GET", token, None)
+        if status >= 400:
+            print(f"  walk: could not list {dir_path}: {data.get('description') or data}")
+            return None
+        all_entries.extend(data.get("files", data.get("entries", [])))
+        paging    = data.get("paging", {})
+        next_page = paging.get("next") if paging else None
+        page_count += 1
+    return all_entries
+
+def walk_files_recursive(host, token, root_path):
+    """Walk root_path and every subdirectory beneath it, returning a flat
+    list of (id, path) for every regular file found. Directories themselves
+    hold no cached data blocks, so they're never included in the result —
+    only their descendant files are eviction candidates.
+    """
+    found = []
+    stack = [root_path.rstrip("/") or "/"]
+    while stack:
+        cur = stack.pop()
+        entries = list_dir_entries(host, token, cur)
+        if entries is None:
+            continue  # skip unreadable subtrees rather than aborting the whole walk
+        for e in entries:
+            path = e.get("path") or (cur.rstrip("/") + "/" + entry_name(e))
+            if e.get("type") == "FS_FILE_TYPE_FILE":
+                found.append((e.get("id"), path))
+            elif e.get("type") == "FS_FILE_TYPE_DIRECTORY":
+                stack.append(path)
+    return found
+
+def dedupe_evict_selection(items):
+    """Given raw selected items [{path, type, id?}], drop any item already
+    covered by another selected folder in the same batch — e.g. a folder and
+    one of its own children both checked — so the caller doesn't double-walk
+    or double-evict the overlap.
+
+    Returns (folder_paths, file_items) where file_items is [{id, path}].
+    """
+    def norm(p):
+        return p.rstrip("/") or "/"
+    folders = sorted({norm(i["path"]) for i in items if i.get("type") == "folder"})
+    pruned_folders = [
+        f for f in folders
+        if not any(other != f and f.startswith(other + "/") for other in folders)
+    ]
+    def under_pruned_folder(path):
+        p = norm(path)
+        return any(p == f or p.startswith(f + "/") for f in pruned_folders)
+    file_items = [
+        {"id": i.get("id"), "path": norm(i["path"])}
+        for i in items
+        if i.get("type") == "file" and not under_pruned_folder(i["path"])
+    ]
+    return pruned_folders, file_items
+
+def run_eviction_job(job_id, host, token, items):
+    """Background worker (runs in its own thread): resolve the selection into
+    a flat file list, then evict each file via POST /v1/portal/files/{id}/evict,
+    updating the shared job record as it goes so the frontend can poll progress.
+    """
+    folders, file_items = dedupe_evict_selection(items)
+    all_files = [(f["id"], f["path"]) for f in file_items]
+    for folder in folders:
+        all_files.extend(walk_files_recursive(host, token, folder))
+
+    job = evict_jobs.get(job_id)
+    if job is None:
+        return  # swept before the walk finished — shouldn't normally happen
+    with evict_jobs_lock:
+        job["total"]  = len(all_files)
+        job["status"] = "evicting"
+
+    def evict_one(item):
+        file_id, file_path = item
+        if not file_id:
+            return 0, {"path": file_path, "error": "Missing file ID"}
+        status, data = qumulo_request(host, f"/v1/portal/files/{file_id}/evict", "POST", token, {})
+        if status >= 400:
+            err = data.get("description") or data.get("__raw") or str(data)
+            return 0, {"path": file_path, "error": err}
+        return int(data.get("evicted_blocks") or 0), None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=EVICT_WORKERS) as executor:
+        for blocks, error in executor.map(evict_one, all_files):
+            with evict_jobs_lock:
+                job["completed"] += 1
+                job["evicted_blocks"] += blocks
+                if error:
+                    job["errors"].append(error)
+
+    with evict_jobs_lock:
+        job["status"] = "done"
+    # flush=True: this runs on a background thread — without it the line can sit in
+    # stdout's buffer indefinitely under systemd, long after the job actually finished.
+    print(f"  Evict job {job_id} done: {job['completed']}/{job['total']} processed, "
+          f"{len(job['errors'])} error(s), {job['evicted_blocks']} blocks freed", flush=True)
+
 # ── Admin password update ─────────────────────────────────────────────
 def update_admin_password_in_config(new_hash):
     """Rewrite ADMIN_PASSWORD_HASH in config.py with the new hash."""
@@ -635,10 +767,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 print(f"  Browse first entry: {entries[0]}")
 
             # Fetch attributes for files (not directories) to get cache info
-            # Qumulo may use 'name' or 'file_name' depending on API version
-            def entry_name(e):
-                return e.get("name") or e.get("file_name") or e.get("filename") or ""
-
             files   = [e for e in entries if e.get("type") == "FS_FILE_TYPE_FILE"]
             folders = [e for e in entries if e.get("type") != "FS_FILE_TYPE_FILE"]
 
@@ -659,7 +787,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"  Browse: page {page_num}/{total_pages}, showing {len(files_page)} of {total_files} files")
 
             # Fetch attributes only for current page's files
-            import concurrent.futures
             file_attrs   = {}
             ATTR_WORKERS = 32
 
@@ -696,6 +823,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "total_files": total_files,
                     "total_pages": total_pages,
                 },
+            })
+            return
+
+        # Poll cache eviction job status
+        if path.startswith("/app/evict/"):
+            username = self.require_portal_manager()
+            if not username: return
+            job_id = path.split("/")[3] if len(path.split("/")) > 3 else ""
+            job    = evict_jobs.get(job_id)
+            if not job:
+                self.send_json(404, {"error": "Eviction job not found (it may have expired)."})
+                return
+            self.send_json(200, {
+                "status":         job["status"],
+                "total":          job["total"],
+                "completed":      job["completed"],
+                "evicted_blocks": job["evicted_blocks"],
+                "errors":         job["errors"],
             })
             return
 
@@ -1031,6 +1176,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "spoke_entry": spoke_entry, "hub_entry": accept_result})
             return
 
+
+        # Count how many files a proposed eviction would affect
+        if path == "/app/evict/preview":
+            username = self.require_portal_manager()
+            if not username: return
+            spoke_id = payload.get("spoke_id", "")
+            items    = payload.get("items", [])
+            user     = get_user_state(username)
+            spoke    = user["spokes"].get(spoke_id)
+            if not spoke:
+                self.send_json(404, {"error": f"Spoke not found (id={spoke_id})"})
+                return
+            if not items:
+                self.send_json(400, {"error": "No items selected."})
+                return
+            token, err = get_cluster_token(username, "spoke", spoke_id)
+            if err:
+                self.send_json(401, {"error": err})
+                return
+
+            folders, file_items = dedupe_evict_selection(items)
+            breakdown = [{"path": f["path"], "type": "file", "file_count": 1} for f in file_items]
+            total     = len(file_items)
+            for folder in folders:
+                count = len(walk_files_recursive(spoke["host"], token, folder))
+                breakdown.append({"path": folder, "type": "folder", "file_count": count})
+                total += count
+
+            print(f"  Evict preview: {len(items)} selected item(s) -> {total} file(s)")
+            self.send_json(200, {"total_files": total, "breakdown": breakdown})
+            return
+
+        # Start a cache eviction job
+        if path == "/app/evict":
+            username = self.require_portal_manager()
+            if not username: return
+            spoke_id = payload.get("spoke_id", "")
+            items    = payload.get("items", [])
+            user     = get_user_state(username)
+            spoke    = user["spokes"].get(spoke_id)
+            if not spoke:
+                self.send_json(404, {"error": f"Spoke not found (id={spoke_id})"})
+                return
+            if not items:
+                self.send_json(400, {"error": "No items selected."})
+                return
+            token, err = get_cluster_token(username, "spoke", spoke_id)
+            if err:
+                self.send_json(401, {"error": err})
+                return
+
+            sweep_evict_jobs()
+            job_id = uuid.uuid4().hex
+            evict_jobs[job_id] = {
+                "status":         "walking",   # walking -> evicting -> done
+                "total":          0,
+                "completed":      0,
+                "evicted_blocks": 0,
+                "errors":         [],
+                "started_at":     time.time(),
+            }
+            host = spoke["host"]
+            thread = threading.Thread(
+                target=run_eviction_job, args=(job_id, host, token, items), daemon=True)
+            thread.start()
+
+            print(f"  Evict job {job_id} started: {len(items)} selected item(s) on spoke {spoke_id}")
+            self.send_json(200, {"job_id": job_id})
+            return
 
         # Proxy a Qumulo API call
         if path == "/proxy":
