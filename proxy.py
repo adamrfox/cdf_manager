@@ -116,6 +116,17 @@ evict_jobs_lock = threading.Lock()
 EVICT_JOB_TTL   = 3600   # seconds — sweep jobs older than this on each request
 EVICT_WORKERS   = 32     # matches ATTR_WORKERS in the browse endpoint
 
+# Qumulo error_class values that get a friendlier message than the raw API
+# description in the eviction job's per-file error list.
+EVICT_ERROR_MESSAGES = {
+    # A read-write spoke's local writes have to replicate up to the hub
+    # before it's safe to evict the only durable copy — Qumulo refuses the
+    # evict rather than risk data loss. Expected/transient right after a
+    # write; retrying once replication catches up should succeed.
+    "fs_portal_evict_dirty_inode_error":
+        "Too recently written — not yet replicated to the hub. Wait and retry.",
+}
+
 def sweep_evict_jobs():
     now = time.time()
     stale = [jid for jid, j in evict_jobs.items() if now - j["started_at"] > EVICT_JOB_TTL]
@@ -489,7 +500,8 @@ def run_eviction_job(job_id, host, token, items):
             return 0, {"path": file_path, "error": "Missing file ID"}
         status, data = qumulo_request(host, f"/v1/portal/files/{file_id}/evict", "POST", token, {})
         if status >= 400:
-            err = data.get("description") or data.get("__raw") or str(data)
+            err = (EVICT_ERROR_MESSAGES.get(data.get("error_class"))
+                   or data.get("description") or data.get("__raw") or str(data))
             return 0, {"path": file_path, "error": err}
         return int(data.get("evicted_blocks") or 0), None
 
