@@ -1,8 +1,16 @@
 """
-config.py — CDF Manager configuration
---------------------------------------
-Defines the built-in admin account and runtime settings.
-Additional users are managed via the web UI and stored in users.json.
+config.py.example — copy to config.py and edit before deploying.
+
+    cp config.py.example config.py
+
+config.py is gitignored — it holds the real admin password hash and
+should never be committed. (An earlier version of this repo committed a
+real config.py; that hash has since been rotated and the file removed —
+see README.md's Security Notes.)
+
+Docker deployments don't need this file at all — config.py is generated
+automatically from environment variables on first boot. See README.md's
+Docker Deployment section.
 
 To generate a password hash:
     python3 -c "import hashlib; print(hashlib.sha256('yourpassword'.encode()).hexdigest())"
@@ -14,7 +22,7 @@ import hashlib
 # Built-in — always available, cannot be deleted or have its role changed.
 # CHANGE THE PASSWORD before deploying!
 ADMIN_USERNAME        = "admin"
-ADMIN_PASSWORD_HASH   = "250fa54d30e123cb149523751b2b8d24deb4fa3d18c13fe0499c67f26f47153e"
+ADMIN_PASSWORD_HASH   = hashlib.sha256("change_me".encode()).hexdigest()
 
 # ── SESSION SETTINGS ───────────────────────────────────────────────────
 APP_SESSION_EXPIRY_SECONDS = 8 * 60 * 60   # 8 hours

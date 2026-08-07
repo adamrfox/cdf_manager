@@ -55,29 +55,21 @@ cd cdf_manager
 
 ### 2. Configure the admin account
 
-Edit `config.py` and set a strong admin password:
+`config.py` is gitignored — it holds the real admin password hash and should
+never be committed. Copy the template and edit it:
 
-```python
-import hashlib
-
-ADMIN_USERNAME      = "admin"
-ADMIN_PASSWORD_HASH = hashlib.sha256("your_password_here".encode()).hexdigest()
-
-APP_SESSION_EXPIRY_SECONDS = 8 * 60 * 60   # 8 hours
-QUMULO_TOKEN_EXPIRY_DAYS   = 30
-
-STATE_FILE    = "state.json"
-USERS_FILE    = "users.json"
-SESSIONS_FILE = "sessions.json"
-SETTINGS_FILE = "settings.json"
-
-PROXY_PORT = 8081
+```bash
+cp config.py.example config.py
 ```
 
-To generate a password hash:
+Generate a password hash and set it as `ADMIN_PASSWORD_HASH`:
 ```bash
 python3 -c "import hashlib; print(hashlib.sha256('yourpassword'.encode()).hexdigest())"
 ```
+
+See `config.py.example` for the other settings (`APP_SESSION_EXPIRY_SECONDS`,
+`QUMULO_TOKEN_EXPIRY_DAYS`, file paths, `PROXY_PORT`) — the defaults are
+fine for most setups.
 
 ### 3. Deploy files
 
@@ -395,8 +387,16 @@ settings.json
 - Access tokens are stored in `state.json` with a configurable expiry (default 30 days)
 - App session tokens are stored in `sessions.json` and expire after 8 hours
 - SSL verification is disabled for Qumulo API calls to support self-signed certificates
-- The admin password is stored as a SHA-256 hash in `config.py`
+- The admin password is stored as a SHA-256 hash in `config.py`, which is
+  **gitignored** — copy `config.py.example` and never commit the real file
 - It is recommended to run behind a VPN or restrict access to trusted networks
+
+> **Past incident:** early commits of this repo (`8f51f81` through `bd005dd`)
+> included a real `config.py` with a live admin password hash. It was
+> removed from tracking and the password rotated once discovered
+> (2026-08-07); the hash is still visible in git history for anyone with
+> repo access, though it's now worthless since the password changed. If you
+> cloned before that date, don't reuse the hash from your local history.
 
 ---
 

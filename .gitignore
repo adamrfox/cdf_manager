@@ -1,3 +1,4 @@
+config.py
 state.json
 users.json
 sessions.json
