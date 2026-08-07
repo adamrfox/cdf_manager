@@ -1,0 +1,17 @@
+# Runtime-generated / secret — supplied via the /data volume instead
+config.py
+state.json
+users.json
+sessions.json
+settings.json
+*.bak
+
+# Not part of the image
+.git
+.gitignore
+__pycache__/
+*.pyc
+README.md
+geonosis
+qumulo-monitor.html
+.claude/

@@ -40,6 +40,8 @@ Browser → nginx (port 3000) → proxy.py (port 8081) → Qumulo clusters (port
 - A Linux server with network access to your Qumulo clusters on **port 8000** (Qumulo REST API)
 - Port 3713 (replication) must be open **between hub and spoke Qumulo clusters** — CDF Manager itself does not use this port
 
+Alternatively, skip the Python/nginx setup entirely and run the [Docker image](#docker-deployment) — it only needs Docker.
+
 ---
 
 ## Installation
@@ -82,6 +84,15 @@ python3 -c "import hashlib; print(hashlib.sha256('yourpassword'.encode()).hexdig
 ```bash
 sudo mkdir -p /var/www/cdf_manager
 sudo cp proxy.py config.py cdf-manager.html /var/www/cdf_manager/
+
+# nginx's static root below points at this subdirectory, not the app
+# directory itself — proxy.py, config.py, and the runtime state files
+# (which hold Qumulo access tokens and session tokens!) must never be
+# reachable by direct URL. The symlink keeps cdf-manager.html itself as
+# the single source of truth — no separate copy to keep in sync.
+sudo mkdir -p /var/www/cdf_manager/static
+sudo ln -s ../cdf-manager.html /var/www/cdf_manager/static/cdf-manager.html
+
 sudo chown -R www-data:www-data /var/www/cdf_manager
 sudo chmod 755 /var/www/cdf_manager
 sudo chmod 644 /var/www/cdf_manager/*.py /var/www/cdf_manager/*.html
@@ -94,8 +105,6 @@ Create `/etc/nginx/sites-enabled/cdf-manager`:
 ```nginx
 server {
     listen 3000;
-    root /var/www/cdf_manager;
-    index cdf-manager.html;
 
     location /app/ {
         if ($request_method = OPTIONS) {
@@ -135,11 +144,20 @@ server {
     }
 
     location / {
-        root /var/www/cdf_manager;
+        root /var/www/cdf_manager/static;   # only cdf-manager.html lives here — see step 3
+        index cdf-manager.html;
         try_files $uri $uri/ =404;
     }
 }
 ```
+
+> **Security note:** an earlier version of this README (and of the geonosis
+> deployment) pointed `root` directly at `/var/www/cdf_manager`, which made
+> `proxy.py`, `config.py`, and the runtime state files — `state.json` in
+> particular, which holds live Qumulo access tokens — fetchable by anyone
+> who could reach the port, e.g. `GET /state.json`. If you deployed from an
+> older copy of this doc, check `curl http://your-server:3000/state.json`
+> and fix your nginx config's `root` if it returns anything but a 404.
 
 Test and reload nginx:
 ```bash
@@ -185,6 +203,83 @@ http://your-server:3000/cdf-manager.html
 ```
 
 Log in with the admin credentials you configured in `config.py`.
+
+---
+
+## Docker Deployment
+
+A single container runs nginx and proxy.py together, as an alternative to
+the manual install above — no host nginx or systemd setup required.
+
+### 1. Build the image
+
+```bash
+git clone https://github.com/adamrfox/cdf_manager.git
+cd cdf_manager
+docker build -t cdf-manager .
+```
+
+### 2. Run it
+
+```bash
+mkdir -p /opt/cdf-manager/data
+docker run -d --name cdf-manager \
+  --restart unless-stopped \
+  -p 3000:80 \
+  -e ADMIN_PASSWORD=your_password_here \
+  -v /opt/cdf-manager/data:/data \
+  cdf-manager
+```
+
+Bind-mount a real host directory to `/data` — it holds `config.py`
+(generated from the env vars below on first boot) and the app's runtime
+state (`state.json`, `users.json`, `sessions.json`, `settings.json`), all
+of which need to survive container recreation and image upgrades.
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADMIN_USERNAME` | `admin` | Built-in admin account username |
+| `ADMIN_PASSWORD` | — | Plaintext admin password, hashed on first boot. Required unless `ADMIN_PASSWORD_HASH` is set. |
+| `ADMIN_PASSWORD_HASH` | — | Pre-computed SHA-256 hash (`python3 -c "import hashlib; print(hashlib.sha256(b'...').hexdigest())"`) — takes precedence over `ADMIN_PASSWORD` if both are set |
+| `APP_SESSION_EXPIRY_SECONDS` | `28800` (8h) | App login session lifetime |
+| `QUMULO_TOKEN_EXPIRY_DAYS` | `30` | Qumulo access token lifetime |
+
+These are only read on the **first boot**, when `/data/config.py` doesn't
+exist yet. After that the container leaves `config.py` alone — this is
+intentional: changing the admin password through the UI rewrites
+`config.py` in place, and that change needs to survive the next container
+restart rather than being silently reverted by the original env var. To
+reset the admin password, delete `config.py` from the mounted `/data`
+directory and restart the container (or edit `ADMIN_PASSWORD_HASH` in
+`/data/config.py` directly, same as the bare-metal
+[Reset admin password](#reset-admin-password) instructions).
+
+### Access the application
+
+```
+http://your-docker-host:3000/
+```
+
+### Updating
+
+```bash
+git pull
+docker build -t cdf-manager .
+docker stop cdf-manager && docker rm cdf-manager
+docker run -d --name cdf-manager --restart unless-stopped -p 3000:80 \
+  -v /opt/cdf-manager/data:/data cdf-manager
+```
+No env vars needed on subsequent runs — `config.py` already exists in `/data`.
+
+### Logs and health
+
+```bash
+docker logs -f cdf-manager
+docker inspect --format='{{.State.Health.Status}}' cdf-manager
+curl http://localhost:3000/health
+```
 
 ---
 
@@ -324,3 +419,11 @@ curl -sk -X DELETE https://CLUSTER:8000/v1/auth/access-tokens/TOKEN_ID -H "Autho
 ```bash
 sudo chown -R www-data:www-data /var/www/cdf_manager
 ```
+
+### Reset admin password
+
+```bash
+python3 -c "import hashlib; print(hashlib.sha256('newpassword'.encode()).hexdigest())"
+```
+Bare metal — edit `ADMIN_PASSWORD_HASH` in `/var/www/cdf_manager/config.py`, then `sudo systemctl restart cdf-manager`.
+Docker — edit `ADMIN_PASSWORD_HASH` in `config.py` inside the mounted `/data` volume, then `docker restart cdf-manager`.
