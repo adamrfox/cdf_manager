@@ -211,6 +211,13 @@ Log in with the admin credentials you configured in `config.py`.
 A single container runs nginx and proxy.py together, as an alternative to
 the manual install above — no host nginx or systemd setup required.
 
+> **This is how geonosis is deployed** (as of the 2026-08-07 cutover from
+> the old bare-metal systemd service): container name `cdf-manager`, data
+> volume `/var/www/cdf-manager-data`, published on host port 3000. The
+> host's own nginx no longer has a server block for this app — the
+> container's own nginx owns port 3000 directly. See
+> [Updating](#updating) for the exact redeploy command.
+
 ### 1. Build the image
 
 ```bash
@@ -222,12 +229,12 @@ docker build -t cdf-manager .
 ### 2. Run it
 
 ```bash
-mkdir -p /opt/cdf-manager/data
+mkdir -p /var/www/cdf-manager-data
 docker run -d --name cdf-manager \
   --restart unless-stopped \
   -p 3000:80 \
   -e ADMIN_PASSWORD=your_password_here \
-  -v /opt/cdf-manager/data:/data \
+  -v /var/www/cdf-manager-data:/data \
   cdf-manager
 ```
 
@@ -269,7 +276,7 @@ git pull
 docker build -t cdf-manager .
 docker stop cdf-manager && docker rm cdf-manager
 docker run -d --name cdf-manager --restart unless-stopped -p 3000:80 \
-  -v /opt/cdf-manager/data:/data cdf-manager
+  -v /var/www/cdf-manager-data:/data cdf-manager
 ```
 No env vars needed on subsequent runs — `config.py` already exists in `/data`.
 
