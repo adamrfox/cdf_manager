@@ -2168,17 +2168,30 @@ async function browserPrefetchSelected(){
     alert('Could not preview prefetch: '+e.message);
     return;
   }
-  const n = preview.to_fetch;
+  // Large selections skip the already-cached breakdown server-side (see
+  // PREFETCH_PREVIEW_CHECK_LIMIT) to avoid a slow/timing-out preview request —
+  // to_fetch/already_cached come back null in that case, so fall back to the
+  // raw total and note that the job itself will still skip cached files.
+  const breakdownKnown = preview.to_fetch !== null && preview.to_fetch !== undefined;
+  const n = breakdownKnown ? preview.to_fetch : preview.total_files;
   const alreadyCached = preview.already_cached||0;
-  if(n===0){
+  if(breakdownKnown && n===0){
     alert(preview.total_files
       ? 'Nothing to prefetch — all '+preview.total_files+' file'+(preview.total_files!==1?'s':'')+' under the selection '+(preview.total_files!==1?'are':'is')+' already fully cached.'
       : 'Nothing to prefetch — no files found under the selected item(s).');
     return;
   }
-  let msg = 'This will read '+n+' file'+(n!==1?'s':'')+' across '+items.length+' selected item'+(items.length!==1?'s':'')+' to warm the cache.';
-  const excluded = skipped + alreadyCached;
-  if(excluded) msg += '\n('+excluded+' file'+(excluded!==1?'s':'')+' already fully cached — excluded.)';
+  if(!breakdownKnown && n===0){
+    alert('Nothing to prefetch — no files found under the selected item(s).');
+    return;
+  }
+  let msg = 'This will read '+(breakdownKnown?'':'up to ')+n+' file'+(n!==1?'s':'')+' across '+items.length+' selected item'+(items.length!==1?'s':'')+' to warm the cache.';
+  if(breakdownKnown){
+    const excluded = skipped + alreadyCached;
+    if(excluded) msg += '\n('+excluded+' file'+(excluded!==1?'s':'')+' already fully cached — excluded.)';
+  } else {
+    msg += '\n(Large selection — already-cached files will be skipped automatically during the fetch, but couldn\'t be pre-counted.)';
+  }
   msg += '\nContinue?';
   if(!confirm(msg)) return;
 

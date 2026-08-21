@@ -148,6 +148,15 @@ prefetch_jobs_lock    = threading.Lock()
 PREFETCH_JOB_TTL      = 3600
 PREFETCH_MAX_ATTEMPTS = 10   # give up and report the final % reached rather than loop forever
 
+# Above this many files, the preview endpoint skips the already-cached/to-fetch
+# breakdown rather than checking every file's attributes synchronously in the
+# request — at 1000 files that check is still comfortably under nginx's
+# proxy_read_timeout even on a slow link; beyond it, latency would scale with
+# tree size with no bound. The actual job still skips already-cached files
+# during the real fetch either way (see fetch_one_file) — this only affects
+# whether the confirmation dialog can show the breakdown in advance.
+PREFETCH_PREVIEW_CHECK_LIMIT = 1000
+
 def sweep_prefetch_jobs():
     now = time.time()
     stale = [jid for jid, j in prefetch_jobs.items() if now - j["started_at"] > PREFETCH_JOB_TTL]
@@ -1449,12 +1458,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 breakdown.append({"path": folder, "type": "folder", "file_count": len(folder_files)})
                 all_files.extend(folder_files)
 
-            total          = len(all_files)
-            already_cached = count_already_cached(spoke["host"], token, all_files)
-            to_fetch       = total - already_cached
-
-            print(f"  Prefetch preview: {len(items)} selected item(s) -> {total} file(s), "
-                  f"{already_cached} already cached, {to_fetch} to fetch")
+            total = len(all_files)
+            if total <= PREFETCH_PREVIEW_CHECK_LIMIT:
+                already_cached = count_already_cached(spoke["host"], token, all_files)
+                to_fetch       = total - already_cached
+                print(f"  Prefetch preview: {len(items)} selected item(s) -> {total} file(s), "
+                      f"{already_cached} already cached, {to_fetch} to fetch")
+            else:
+                # Too many files to check synchronously without risking a gateway
+                # timeout — the real job still skips already-cached files on its
+                # own (fetch_one_file checks first), this just can't preview it.
+                already_cached = None
+                to_fetch       = None
+                print(f"  Prefetch preview: {len(items)} selected item(s) -> {total} file(s) "
+                      f"(skipping already-cached check — over {PREFETCH_PREVIEW_CHECK_LIMIT})")
             self.send_json(200, {
                 "total_files":    total,
                 "already_cached": already_cached,
