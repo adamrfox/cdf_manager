@@ -561,6 +561,13 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); min-
         Hide non-portal files and folders when browsing
       </label>
     </div>
+    <div class="field">
+      <label>PREFETCH CONCURRENCY</label>
+      <div style="display:flex;align-items:center;gap:12px">
+        <input type="number" id="settings-prefetch-concurrency" min="1" max="64" style="width:120px"/>
+        <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim)">min 1 · max 64 · parallel file reads when prefetching</span>
+      </div>
+    </div>
     <div class="error-msg" id="settings-error"></div>
     <div class="modal-actions">
       <button class="btn sm danger" onclick="closeModal('modal-settings')"><span>CANCEL</span></button>
@@ -1511,6 +1518,7 @@ async function doSettingsOpen(){
     document.getElementById('settings-refresh').value = d.refresh_interval_seconds||30;
     document.getElementById('settings-token-expiry').value = d.token_expiry_days||30;
     document.getElementById('settings-hide-nonportal').checked = d.browser_hide_non_portal||false;
+    document.getElementById('settings-prefetch-concurrency').value = d.prefetch_concurrency||8;
   }catch(e){
     document.getElementById('settings-refresh').value = S.refreshInterval||30;
   }
@@ -1519,17 +1527,19 @@ async function doSettingsOpen(){
 }
 
 async function doSaveSettings(){
-  const val           = parseInt(document.getElementById('settings-refresh').value);
-  const tokenVal      = parseInt(document.getElementById('settings-token-expiry').value);
-  const hideNonPortal = document.getElementById('settings-hide-nonportal').checked;
+  const val               = parseInt(document.getElementById('settings-refresh').value);
+  const tokenVal          = parseInt(document.getElementById('settings-token-expiry').value);
+  const hideNonPortal     = document.getElementById('settings-hide-nonportal').checked;
+  const prefetchConcurrency = parseInt(document.getElementById('settings-prefetch-concurrency').value);
   const err = document.getElementById('settings-error');
   const btn = document.getElementById('settings-submit');
   err.style.display='none';
   if(isNaN(val)||val<5||val>3600){ showErr(err,'Refresh interval must be between 5 and 3600 seconds.'); return; }
   if(isNaN(tokenVal)||tokenVal<1||tokenVal>365){ showErr(err,'Token expiry must be between 1 and 365 days.'); return; }
+  if(isNaN(prefetchConcurrency)||prefetchConcurrency<1||prefetchConcurrency>64){ showErr(err,'Prefetch concurrency must be between 1 and 64.'); return; }
   btn.disabled=true; btn.querySelector('span').textContent='SAVING...';
   try{
-    const d = await api('/app/settings','PATCH',{refresh_interval_seconds:val, token_expiry_days:tokenVal, browser_hide_non_portal:hideNonPortal},true);
+    const d = await api('/app/settings','PATCH',{refresh_interval_seconds:val, token_expiry_days:tokenVal, browser_hide_non_portal:hideNonPortal, prefetch_concurrency:prefetchConcurrency},true);
     S.refreshInterval = d.refresh_interval_seconds;
     S.hideNonPortal   = d.browser_hide_non_portal||false;
     restartRefresh(S.refreshInterval);
@@ -1611,8 +1621,9 @@ function renderBrowserTab(){
     +'</div>'
     // Breadcrumb
     +'<div class="breadcrumb" id="browser-breadcrumb" style="margin-bottom:14px"></div>'
-    // Eviction job progress — persists across content re-renders, hidden until a job starts
+    // Eviction / prefetch job progress — persists across content re-renders, hidden until a job starts
     +'<div id="evict-status" style="display:none;margin-bottom:14px"></div>'
+    +'<div id="prefetch-status" style="display:none;margin-bottom:14px"></div>'
     // Content
     +'<div id="browser-content">'
     +(browserState.spokeId
@@ -1936,7 +1947,8 @@ function renderBrowserContent(d){
     +(filterActive?'<span style="color:var(--accent)">⌕ filtered: '+visibleFiles.length+' match'+(visibleFiles.length!==1?'es':'')+'</span>':'')
     +'</div>'
     +(canEvict && browserState.selected.size>0
-      ?'<button class="btn xs danger" onclick="browserEvictSelected()"><span>🗑 EVICT SELECTED ('+browserState.selected.size+')</span></button>'
+      ?'<button class="btn xs" onclick="browserPrefetchSelected()"><span>⬇ PREFETCH SELECTED ('+browserState.selected.size+')</span></button>'
+       +'<button class="btn xs danger" onclick="browserEvictSelected()"><span>🗑 EVICT SELECTED ('+browserState.selected.size+')</span></button>'
       :'')
     +(totPages>1
       ?'<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'
@@ -2018,9 +2030,35 @@ function browserSelectAllPage(checked){
   if(browserState.lastData) renderBrowserContent(browserState.lastData);
 }
 
+// Drop already-on-screen files that have nothing to gain from the action —
+// a file whose cache % we already know (it's in the currently-loaded page's
+// attributes) is excluded when it's at excludePct already. Folders and any
+// file we don't currently have attrs for (selected on another page) pass
+// through untouched — recursion / a fresh check handles those server-side.
+function filterSelectionByCache(excludePct){
+  const attrs = (browserState.lastData && browserState.lastData.attributes) || {};
+  const items = [];
+  let skipped = 0;
+  for(const [path, v] of browserState.selected.entries()){
+    if(v.type === 'file'){
+      const name = path.split('/').pop();
+      const a = attrs[v.id || name];
+      if(a && getCachePct(a) === excludePct){ skipped++; continue; }
+    }
+    items.push({path, type: v.type, id: v.id});
+  }
+  return {items, skipped};
+}
+
 async function browserEvictSelected(){
   if(browserState.selected.size===0) return;
-  const items = Array.from(browserState.selected.entries()).map(([path,v])=>({path, type:v.type, id:v.id}));
+  const {items, skipped} = filterSelectionByCache(0);   // nothing cached -> nothing to evict
+  if(items.length===0){
+    alert(skipped
+      ? 'Nothing to evict — the selected file'+(skipped!==1?'s are':' is')+' not cached.'
+      : 'Nothing to evict — no files found under the selected item(s).');
+    return;
+  }
 
   let preview;
   try{
@@ -2034,7 +2072,9 @@ async function browserEvictSelected(){
     alert('Nothing to evict — no files found under the selected item(s).');
     return;
   }
-  const msg = 'This will evict '+n+' file'+(n!==1?'s':'')+' across '+items.length+' selected item'+(items.length!==1?'s':'')+'.\nContinue?';
+  let msg = 'This will evict '+n+' file'+(n!==1?'s':'')+' across '+items.length+' selected item'+(items.length!==1?'s':'')+'.';
+  if(skipped) msg += '\n('+skipped+' selected file'+(skipped!==1?'s':'')+' already not cached — excluded.)';
+  msg += '\nContinue?';
   if(!confirm(msg)) return;
 
   let start;
@@ -2108,6 +2148,132 @@ function pollEvictJob(jobId){
   }
   tick();
   evictPollTimer = setInterval(tick, 1000);
+}
+
+// ══ CACHE PREFETCH (opposite of eviction — warms the cache) ════════════
+async function browserPrefetchSelected(){
+  if(browserState.selected.size===0) return;
+  const {items, skipped} = filterSelectionByCache(100);   // already fully cached -> nothing to prefetch
+  if(items.length===0){
+    alert(skipped
+      ? 'Nothing to prefetch — the selected file'+(skipped!==1?'s are':' is')+' already fully cached.'
+      : 'Nothing to prefetch — no files found under the selected item(s).');
+    return;
+  }
+
+  let preview;
+  try{
+    preview = await api('/app/prefetch/preview','POST',{spoke_id:browserState.spokeId, items},true);
+  }catch(e){
+    alert('Could not preview prefetch: '+e.message);
+    return;
+  }
+  const n = preview.to_fetch;
+  const alreadyCached = preview.already_cached||0;
+  if(n===0){
+    alert(preview.total_files
+      ? 'Nothing to prefetch — all '+preview.total_files+' file'+(preview.total_files!==1?'s':'')+' under the selection '+(preview.total_files!==1?'are':'is')+' already fully cached.'
+      : 'Nothing to prefetch — no files found under the selected item(s).');
+    return;
+  }
+  let msg = 'This will read '+n+' file'+(n!==1?'s':'')+' across '+items.length+' selected item'+(items.length!==1?'s':'')+' to warm the cache.';
+  const excluded = skipped + alreadyCached;
+  if(excluded) msg += '\n('+excluded+' file'+(excluded!==1?'s':'')+' already fully cached — excluded.)';
+  msg += '\nContinue?';
+  if(!confirm(msg)) return;
+
+  let start;
+  try{
+    start = await api('/app/prefetch','POST',{spoke_id:browserState.spokeId, items},true);
+  }catch(e){
+    alert('Could not start prefetch: '+e.message);
+    return;
+  }
+  browserState.selected.clear();
+  if(browserState.lastData) renderBrowserContent(browserState.lastData);
+  pollPrefetchJob(start.job_id);
+}
+
+async function browserCancelPrefetch(jobId){
+  try{
+    await api('/app/prefetch/'+jobId+'/cancel','POST',null,true);
+  }catch(e){
+    alert('Could not cancel prefetch: '+e.message);
+  }
+}
+
+let prefetchPollTimer = null;
+function renderPrefetchStatus(banner, job, jobId){
+  const pct = job.total ? Math.min(100, Math.round(job.completed/job.total*100)) : 0;
+  if(job.status==='walking'){
+    banner.innerHTML = '<div style="display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--text-dim)">'
+      +'<div class="spinner" style="width:12px;height:12px"></div> Counting files to prefetch…</div>';
+    return;
+  }
+  if(job.status==='fetching'){
+    banner.innerHTML =
+      '<div style="display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:11px;color:var(--text-dim)">'
+      +'<span>Prefetching… '+job.completed+' / '+job.total+' ('+pct+'%)'
+      +(job.skipped?' — '+job.skipped+' already cached':'')
+      +(job.stalled.length?' — <span style="color:var(--warn)">'+job.stalled.length+' stalled</span>':'')
+      +(job.errors.length?' — <span style="color:var(--danger)">'+job.errors.length+' error'+(job.errors.length!==1?'s':'')+'</span>':'')
+      +'</span>'
+      +'<button class="btn xs danger" onclick="browserCancelPrefetch(\''+jobId+'\')"><span>CANCEL</span></button>'
+      +'</div>'
+      +'<div class="cache-bar-track" style="margin-top:4px"><div class="cache-bar-fill" style="width:'+pct+'%;background:var(--accent)"></div></div>';
+    return;
+  }
+  // done or cancelled
+  const label = job.status==='cancelled' ? 'Cancelled' : 'Prefetched';
+  const okColor = job.status==='cancelled' ? 'var(--warn)' : 'var(--ok)';
+  const fetched = job.completed - job.errors.length - job.stalled.length - (job.skipped||0);
+  let html = '<div style="font-family:var(--mono);font-size:11px">'
+    +'<span style="color:'+okColor+'">✓ '+label+' '+fetched+' / '+job.total+' file'+(job.total!==1?'s':'')+'</span>'
+    +(job.skipped?' — <span style="color:var(--text-dim)">'+job.skipped+' already cached</span>':'');
+  if(job.stalled.length){
+    html += ' — <span style="color:var(--warn)">'+job.stalled.length+' stalled after 10 attempt'+(job.stalled.length!==1?'s':'')+'</span>'
+      +' <a href="#" onclick="event.preventDefault();const d=this.nextElementSibling;d.style.display=d.style.display===\'none\'?\'block\':\'none\'" style="color:var(--accent)">(show)</a>'
+      +'<div style="display:none;margin-top:6px;max-height:120px;overflow-y:auto;color:var(--warn);font-size:10px">'
+      +job.stalled.map(s=>esc(s.path)+': '+s.pct+'%').join('<br>')
+      +'</div>';
+  }
+  if(job.errors.length){
+    html += ' — <span style="color:var(--danger)">'+job.errors.length+' error'+(job.errors.length!==1?'s':'')+'</span>'
+      +' <a href="#" onclick="event.preventDefault();const d=this.nextElementSibling;d.style.display=d.style.display===\'none\'?\'block\':\'none\'" style="color:var(--accent)">(show)</a>'
+      +'<div style="display:none;margin-top:6px;max-height:120px;overflow-y:auto;color:var(--danger);font-size:10px">'
+      +job.errors.map(e=>esc(e.path)+': '+esc(e.error)).join('<br>')
+      +'</div>';
+  }
+  html += ' <button class="btn xs" style="margin-left:8px" onclick="document.getElementById(\'prefetch-status\').style.display=\'none\'"><span>DISMISS</span></button></div>';
+  banner.innerHTML = html;
+}
+
+function pollPrefetchJob(jobId){
+  // Re-lookup the banner element on every tick rather than caching it — switching tabs
+  // away and back re-renders #panel-browser (see switchTab), which replaces this node.
+  if(prefetchPollTimer) clearInterval(prefetchPollTimer);
+
+  async function tick(){
+    const banner = document.getElementById('prefetch-status');
+    let job;
+    try{
+      job = await api('/app/prefetch/'+jobId,'GET',null,true);
+    }catch(e){
+      clearInterval(prefetchPollTimer);
+      if(banner) banner.innerHTML = '<div style="color:var(--danger);font-family:var(--mono);font-size:11px">Prefetch status error: '+esc(e.message)+'</div>';
+      return;
+    }
+    if(banner){
+      banner.style.display = 'block';
+      renderPrefetchStatus(banner, job, jobId);
+    }
+    if(job.status==='done' || job.status==='cancelled'){
+      clearInterval(prefetchPollTimer);
+      browserLoad(browserState.path);   // refresh so cache % reflects the prefetch
+    }
+  }
+  tick();
+  prefetchPollTimer = setInterval(tick, 1000);
 }
 
 // ══ CHANGE PASSWORD ═══════════════════════════════════════════════════

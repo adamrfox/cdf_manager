@@ -35,6 +35,10 @@ Endpoints:
   POST   /app/evict/preview              — count files an eviction would affect [portal_manager+]
   POST   /app/evict                      — start a cache eviction job [portal_manager+]
   GET    /app/evict/{job_id}             — poll eviction job status [portal_manager+]
+  POST   /app/prefetch/preview           — count files a prefetch would affect [portal_manager+]
+  POST   /app/prefetch                   — start a cache prefetch job [portal_manager+]
+  GET    /app/prefetch/{job_id}          — poll prefetch job status [portal_manager+]
+  POST   /app/prefetch/{job_id}/cancel   — cancel a running prefetch job [portal_manager+]
 
   POST   /proxy                          — proxy Qumulo API call
   GET    /health                         — health check
@@ -133,11 +137,29 @@ def sweep_evict_jobs():
     for jid in stale:
         del evict_jobs[jid]
 
+# ── Cache prefetch jobs ──────────────────────────────────────────────────
+# Opposite of eviction: reads a file's full content to warm the spoke's local
+# cache. In-memory only, same lifecycle shape as evict_jobs.
+# { job_id: { status: "walking"|"fetching"|"done"|"cancelled", total, completed,
+#             stalled: [{path, pct}], errors: [{path, error}],
+#             cancel_requested, started_at } }
+prefetch_jobs         = {}
+prefetch_jobs_lock    = threading.Lock()
+PREFETCH_JOB_TTL      = 3600
+PREFETCH_MAX_ATTEMPTS = 10   # give up and report the final % reached rather than loop forever
+
+def sweep_prefetch_jobs():
+    now = time.time()
+    stale = [jid for jid, j in prefetch_jobs.items() if now - j["started_at"] > PREFETCH_JOB_TTL]
+    for jid in stale:
+        del prefetch_jobs[jid]
+
 # ── Settings persistence ───────────────────────────────────────────────
 DEFAULT_SETTINGS = {
     "refresh_interval_seconds": 30,
     "token_expiry_days":        30,
     "browser_hide_non_portal":  False,
+    "prefetch_concurrency":     8,   # lower than EVICT_WORKERS — this moves real data, not just metadata
 }
 
 def load_settings():
@@ -520,6 +542,129 @@ def run_eviction_job(job_id, host, token, items):
     print(f"  Evict job {job_id} done: {job['completed']}/{job['total']} processed, "
           f"{len(job['errors'])} error(s), {job['evicted_blocks']} blocks freed", flush=True)
 
+# ── Cache prefetch (opposite of eviction) ────────────────────────────────
+def cache_pct_from_attrs(attrs):
+    """Mirrors getCachePct() in the frontend: % of a file's data currently
+    cached locally on the spoke, from datablocks vs logical_datablocks (or a
+    size-derived block count when logical_datablocks isn't populated)."""
+    if not attrs:
+        return None
+    d = attrs.get("file_attributes", attrs)
+    data    = int(d.get("datablocks") or 0)
+    logical = int(d.get("logical_datablocks") or 0)
+    if logical == 0 and d.get("size"):
+        logical = -(-int(d["size"]) // 4096)   # ceiling division
+    if logical == 0:
+        return 100 if data > 0 else 0
+    return min(100.0, data / logical * 100)
+
+def count_already_cached(host, token, file_tuples):
+    """Given [(id, path), ...], check how many are already fully cached —
+    used to make the prefetch preview honest about how many files a
+    recursive prefetch would actually need to read, not just how many exist
+    under the selection."""
+    if not file_tuples:
+        return 0
+    def is_cached(item):
+        _, path = item
+        encoded = quote(path, safe='')
+        status, data = qumulo_request(host, f"/v1/files/{encoded}/info/attributes", "GET", token, None)
+        return status == 200 and (cache_pct_from_attrs(data) or 0) >= 100
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        return sum(executor.map(is_cached, file_tuples))
+
+def fetch_one_file(host, token, path):
+    """Read a file's full content via the Qumulo API to warm the spoke's
+    local cache. The body is streamed and discarded in chunks — the bytes
+    themselves don't matter, only that the read reached the server. Retries
+    up to PREFETCH_MAX_ATTEMPTS times if a read doesn't leave the file fully
+    cached. Checks the cache state first and skips the read entirely if the
+    file is already fully cached — this is what lets a recursive prefetch
+    over a folder skip files that don't need fetching, without the caller
+    having to know that in advance.
+    Returns (final_pct, attempts_used, error_or_None, already_cached).
+    """
+    encoded  = quote(path, safe='')
+    api_host = host if ":" in host else host + ":8000"
+
+    a_status, a_data = qumulo_request(host, f"/v1/files/{encoded}/info/attributes", "GET", token, None)
+    if a_status == 200:
+        pct = cache_pct_from_attrs(a_data) or 0
+        if pct >= 100:
+            return pct, 0, None, True
+
+    last_pct = 0
+    for attempt in range(1, PREFETCH_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            f"https://{api_host}/v1/files/{encoded}/data",
+            headers={"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"})
+        try:
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=120) as resp:
+                while resp.read(65536):
+                    pass   # discard — only warming the cache matters, not the content
+        except urllib.error.HTTPError as e:
+            e.read()
+            return last_pct, attempt, f"HTTP {e.code} reading file", False
+        except Exception as e:
+            return last_pct, attempt, str(e), False
+
+        a_status, a_data = qumulo_request(host, f"/v1/files/{encoded}/info/attributes", "GET", token, None)
+        if a_status != 200:
+            return last_pct, attempt, "Could not verify cache status after read", False
+        last_pct = cache_pct_from_attrs(a_data) or 0
+        if last_pct >= 100:
+            return last_pct, attempt, None, False
+    return last_pct, PREFETCH_MAX_ATTEMPTS, None, False   # gave up — reported as stalled, not an error
+
+def run_prefetch_job(job_id, host, token, items):
+    """Background worker: resolve the selection into a flat file list (same
+    walk/dedupe as eviction), then read each file to warm the spoke's cache,
+    updating the shared job record as it goes so the frontend can poll
+    progress. Concurrency is admin-configurable (settings.prefetch_concurrency)
+    since, unlike eviction, this moves real data across the spoke-hub link.
+    """
+    folders, file_items = dedupe_evict_selection(items)
+    all_files = [(f["id"], f["path"]) for f in file_items]
+    for folder in folders:
+        all_files.extend(walk_files_recursive(host, token, folder))
+
+    job = prefetch_jobs.get(job_id)
+    if job is None:
+        return   # swept before the walk finished — shouldn't normally happen
+    with prefetch_jobs_lock:
+        job["total"]  = len(all_files)
+        job["status"] = "fetching"
+
+    concurrency = max(1, min(64, int(app_settings.get("prefetch_concurrency", 8))))
+
+    def fetch_one(item):
+        file_id, file_path = item
+        # Once cancelled, skip anything not already mid-read rather than starting
+        # new work — a blocking read already in flight can't be interrupted, but
+        # nothing new needs to start after a cancel.
+        if job.get("cancel_requested"):
+            return file_path, None, 0, None, True, False
+        pct, attempts, error, already_cached = fetch_one_file(host, token, file_path)
+        return file_path, pct, attempts, error, False, already_cached
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        for file_path, pct, attempts, error, cancel_skipped, already_cached in executor.map(fetch_one, all_files):
+            with prefetch_jobs_lock:
+                job["completed"] += 1
+                if cancel_skipped:
+                    pass
+                elif already_cached:
+                    job["skipped"] += 1
+                elif error:
+                    job["errors"].append({"path": file_path, "error": error})
+                elif pct is not None and pct < 100:
+                    job["stalled"].append({"path": file_path, "pct": round(pct, 1)})
+
+    with prefetch_jobs_lock:
+        job["status"] = "cancelled" if job.get("cancel_requested") else "done"
+    print(f"  Prefetch job {job_id} {job['status']}: {job['completed']}/{job['total']} processed, "
+          f"{job['skipped']} already cached, {len(job['errors'])} error(s), {len(job['stalled'])} stalled", flush=True)
+
 # ── Admin password update ─────────────────────────────────────────────
 def update_admin_password_in_config(new_hash):
     """Rewrite ADMIN_PASSWORD_HASH in config.py with the new hash."""
@@ -853,6 +998,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "completed":      job["completed"],
                 "evicted_blocks": job["evicted_blocks"],
                 "errors":         job["errors"],
+            })
+            return
+
+        # Poll cache prefetch job status
+        if path.startswith("/app/prefetch/"):
+            username = self.require_portal_manager()
+            if not username: return
+            job_id = path.split("/")[3] if len(path.split("/")) > 3 else ""
+            job    = prefetch_jobs.get(job_id)
+            if not job:
+                self.send_json(404, {"error": "Prefetch job not found (it may have expired)."})
+                return
+            self.send_json(200, {
+                "status":    job["status"],
+                "total":     job["total"],
+                "completed": job["completed"],
+                "skipped":   job["skipped"],
+                "stalled":   job["stalled"],
+                "errors":    job["errors"],
             })
             return
 
@@ -1258,6 +1422,101 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"job_id": job_id})
             return
 
+        # Count how many files a proposed prefetch would affect
+        if path == "/app/prefetch/preview":
+            username = self.require_portal_manager()
+            if not username: return
+            spoke_id = payload.get("spoke_id", "")
+            items    = payload.get("items", [])
+            user     = get_user_state(username)
+            spoke    = user["spokes"].get(spoke_id)
+            if not spoke:
+                self.send_json(404, {"error": f"Spoke not found (id={spoke_id})"})
+                return
+            if not items:
+                self.send_json(400, {"error": "No items selected."})
+                return
+            token, err = get_cluster_token(username, "spoke", spoke_id)
+            if err:
+                self.send_json(401, {"error": err})
+                return
+
+            folders, file_items = dedupe_evict_selection(items)
+            all_files = [(f["id"], f["path"]) for f in file_items]
+            breakdown = [{"path": f["path"], "type": "file", "file_count": 1} for f in file_items]
+            for folder in folders:
+                folder_files = walk_files_recursive(spoke["host"], token, folder)
+                breakdown.append({"path": folder, "type": "folder", "file_count": len(folder_files)})
+                all_files.extend(folder_files)
+
+            total          = len(all_files)
+            already_cached = count_already_cached(spoke["host"], token, all_files)
+            to_fetch       = total - already_cached
+
+            print(f"  Prefetch preview: {len(items)} selected item(s) -> {total} file(s), "
+                  f"{already_cached} already cached, {to_fetch} to fetch")
+            self.send_json(200, {
+                "total_files":    total,
+                "already_cached": already_cached,
+                "to_fetch":       to_fetch,
+                "breakdown":      breakdown,
+            })
+            return
+
+        # Start a cache prefetch job
+        if path == "/app/prefetch":
+            username = self.require_portal_manager()
+            if not username: return
+            spoke_id = payload.get("spoke_id", "")
+            items    = payload.get("items", [])
+            user     = get_user_state(username)
+            spoke    = user["spokes"].get(spoke_id)
+            if not spoke:
+                self.send_json(404, {"error": f"Spoke not found (id={spoke_id})"})
+                return
+            if not items:
+                self.send_json(400, {"error": "No items selected."})
+                return
+            token, err = get_cluster_token(username, "spoke", spoke_id)
+            if err:
+                self.send_json(401, {"error": err})
+                return
+
+            sweep_prefetch_jobs()
+            job_id = uuid.uuid4().hex
+            prefetch_jobs[job_id] = {
+                "status":           "walking",   # walking -> fetching -> done|cancelled
+                "total":            0,
+                "completed":        0,
+                "skipped":          0,   # already fully cached — no read needed
+                "stalled":          [],
+                "errors":           [],
+                "cancel_requested": False,
+                "started_at":       time.time(),
+            }
+            host = spoke["host"]
+            thread = threading.Thread(
+                target=run_prefetch_job, args=(job_id, host, token, items), daemon=True)
+            thread.start()
+
+            print(f"  Prefetch job {job_id} started: {len(items)} selected item(s) on spoke {spoke_id}")
+            self.send_json(200, {"job_id": job_id})
+            return
+
+        # Cancel a running prefetch job
+        if path.startswith("/app/prefetch/") and path.endswith("/cancel"):
+            username = self.require_portal_manager()
+            if not username: return
+            job_id = path.split("/")[3] if len(path.split("/")) > 3 else ""
+            job    = prefetch_jobs.get(job_id)
+            if not job:
+                self.send_json(404, {"error": "Prefetch job not found (it may have expired)."})
+                return
+            job["cancel_requested"] = True
+            print(f"  Prefetch job {job_id}: cancel requested")
+            self.send_json(200, {"ok": True})
+            return
+
         # Proxy a Qumulo API call
         if path == "/proxy":
             username = self.require_session()
@@ -1315,6 +1574,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "browser_hide_non_portal" in updates:
                 if not isinstance(updates["browser_hide_non_portal"], bool):
                     self.send_json(400, {"error": "browser_hide_non_portal must be true or false"})
+                    return
+            if "prefetch_concurrency" in updates:
+                val = updates["prefetch_concurrency"]
+                if not isinstance(val, int) or val < 1 or val > 64:
+                    self.send_json(400, {"error": "prefetch_concurrency must be between 1 and 64"})
                     return
             app_settings.update(updates)
             save_settings(app_settings)
