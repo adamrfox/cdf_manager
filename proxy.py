@@ -366,7 +366,23 @@ def cluster_summary(cid, c):
     }
 
 # ── Qumulo API forwarding ──────────────────────────────────────────────
+# HTTP codes that suggest a /v1 endpoint has been deprecated/removed on this cluster
+V1_FALLBACK_CODES = {404, 405, 410, 501}
+
 def qumulo_request(host, path, method, token, body):
+    """Call the Qumulo API. If a /v1 call fails in a way that looks like the
+    endpoint is gone, retry the same call against /v2. If /v2 also fails,
+    return the original /v1 error since it's usually the more meaningful one."""
+    status, data = _qumulo_request_once(host, path, method, token, body)
+    if status in V1_FALLBACK_CODES and path.startswith("/v1/"):
+        v2_path = "/v2/" + path[len("/v1/"):]
+        print(f"  ... /v1 call returned {status}, retrying as {v2_path}")
+        v2_status, v2_data = _qumulo_request_once(host, v2_path, method, token, body)
+        if 200 <= v2_status < 300:
+            return v2_status, v2_data
+    return status, data
+
+def _qumulo_request_once(host, path, method, token, body):
     if ":" not in host:
         host = host + ":8000"
     url     = f"https://{host}{path}"
